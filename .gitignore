@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+test_archive_*/
+
+# Houdini-generated files
+*.autosave
+*.bak
+*.hiplc
+*.hipnc
+*.log
+
+# Local archive output
+archive/

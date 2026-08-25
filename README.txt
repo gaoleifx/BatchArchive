@@ -1,0 +1,28 @@
+BatchArchive Houdini 批量工程打包工具
+
+推荐双击 `launch_gui.cmd` 运行；`启动BatchArchive.bat` 也保留作为备用启动方式。
+
+使用方法：
+1. 将一个或多个 .hip / .hiplc / .hipnc 文件拖进窗口，也可以点击“添加文件”。
+2. 确认 Houdini hython.exe 路径。
+3. 点击“开始依次打包”。工具按照列表顺序处理，状态会显示在每个文件后面。
+
+过滤选项默认开启：
+- 跳过工程内部缓存输出（缓存节点的 bgeo、sim、vdb 等输出目录/序列）。
+- 跳过工程内部渲染输出（ROP/LOP 渲染节点的 exr、AOV 等输出）。
+取消勾选即可把这些输出也纳入打包；外部输入资源不受过滤影响。
+缓存/渲染节点输出即使指向其他 Houdini 工程的 geo/render 目录，勾选过滤后也会跳过。
+未被过滤的标准 Houdini 目录（geo、abc、render、anim、otls 等）会按标准目录复制，不再自动放进 external。
+
+默认输出：每个 HIP 所在目录的 archive 文件夹。
+如果填写“输出目录”，所有 HIP 会输出到该目录。
+
+每个归档目录都会生成 `package_manifest.json`，其中包含打包状态、校验统计和失败节点明细。只有 JSON 状态为 `success` 且失败列表为空时才算打包完成；校验失败、JSON 缺失或 hython 异常退出会自动重试，单个 HIP 最多尝试 3 次，重试复用同一个归档目录。
+
+工具不会修改原始 HIP；目标已存在时自动使用 _02、_03 等后缀，不覆盖旧包。
+所有改写后的工程内资源路径会使用 `$HIP/...` 形式，确保从归档目录加载。
+
+界面右侧“打包过滤规则”支持五类资源选择，以及红色节点/外部资源节点的 AND 细分筛选；右上角按钮可折叠规则面板。
+规则二默认启用“排除渲染器节点”，Mantra、Karma、Arnold、Redshift、USD Render 等渲染节点不会参与资源打包；取消勾选可恢复。
+
+依赖：Windows、Python 3、PyQt5、Houdini（包含 hython.exe）。
