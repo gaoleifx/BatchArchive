@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import queue
 import subprocess
@@ -124,6 +125,52 @@ class SwitchCheckBox(QtWidgets.QCheckBox):
         painter.setPen(text_color)
         painter.setFont(self.font())
         painter.drawText(QtCore.QRect(62, 0, max(0, self.width() - 62), 28), QtCore.Qt.AlignVCenter | QtCore.Qt.AlignLeft, self.text())
+
+
+class BrandLoader(QtWidgets.QWidget):
+    """Small, low-cost animated sphere that gives the brand row a living cue."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(52, 52)
+        self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents)
+        self.setToolTip("BatchArchive 已就绪")
+        self.phase = 0.0
+        self.timer = QtCore.QTimer(self)
+        self.timer.timeout.connect(self._advance)
+        self.timer.start(55)
+
+    def _advance(self):
+        self.phase = (self.phase + 0.075) % (2 * 3.141592653589793)
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+        center = QtCore.QPointF(self.width() / 2, self.height() / 2)
+
+        glow = QtGui.QRadialGradient(center, 25)
+        glow.setColorAt(0.0, QtGui.QColor(76, 146, 255, 90))
+        glow.setColorAt(0.48, QtGui.QColor(112, 80, 255, 38))
+        glow.setColorAt(1.0, QtGui.QColor(112, 80, 255, 0))
+        painter.setPen(QtCore.Qt.NoPen)
+        painter.setBrush(glow)
+        painter.drawEllipse(QtCore.QRectF(1, 1, 50, 50))
+
+        sphere = QtGui.QRadialGradient(QtCore.QPointF(19, 17), 27)
+        sphere.setColorAt(0.0, QtGui.QColor("#DCEBFF"))
+        sphere.setColorAt(0.28, QtGui.QColor("#6EA8FF"))
+        sphere.setColorAt(0.72, QtGui.QColor("#4161D8"))
+        sphere.setColorAt(1.0, QtGui.QColor("#282D86"))
+        painter.setBrush(sphere)
+        painter.drawEllipse(QtCore.QRectF(10, 10, 32, 32))
+
+        for index, radius in enumerate((4.0, 2.7, 2.0)):
+            angle = self.phase * (1.0 + index * 0.22) + index * 2.1
+            x = 26 + 9.0 * math.cos(angle)
+            y = 26 + 8.0 * math.sin(angle)
+            painter.setBrush(QtGui.QColor(220, 235, 255, 180 - index * 28))
+            painter.drawEllipse(QtCore.QRectF(x - radius, y - radius, radius * 2, radius * 2))
 
 
 class ArchiveWorker(threading.Thread):
@@ -278,6 +325,7 @@ class MainWindow(QtWidgets.QMainWindow):
         root = QtWidgets.QVBoxLayout(central); root.setContentsMargins(24, 22, 24, 20); root.setSpacing(12)
         brand_row = QtWidgets.QHBoxLayout(); brand_row.setSpacing(14)
         brand = QtWidgets.QLabel("浆果文化"); brand.setObjectName("brand"); brand_row.addWidget(brand)
+        brand_row.addWidget(BrandLoader())
         divider = QtWidgets.QLabel("|"); divider.setObjectName("brandDivider"); brand_row.addWidget(divider)
         product = QtWidgets.QLabel("BatchArchive"); product.setObjectName("product"); brand_row.addWidget(product)
         status = QtWidgets.QLabel("● 就绪"); status.setObjectName("status")
@@ -384,9 +432,16 @@ class MainWindow(QtWidgets.QMainWindow):
         QProgressBar { background:#0F141A; border:1px solid #303944; border-radius:5px; text-align:center; color:#E6EDF3; height:9px; }
         QProgressBar::chunk { background:#1677FF; border-radius:4px; }
         QSplitter::handle { background:#252D36; width:1px; }
-        QScrollBar:vertical { background:#0F141A; width:10px; margin:0; }
-        QScrollBar::handle:vertical { background:#3A4653; border-radius:5px; min-height:24px; }
-        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height:0; }
+        QScrollBar:vertical { background:transparent; width:16px; margin:0; }
+        QScrollBar::handle:vertical { background:#2F74D0; border-radius:4px; min-height:48px; margin:0 5px; }
+        QScrollBar::handle:vertical:hover { background:#4D96F5; }
+        QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background:#252C36; border-radius:2px; margin:0 6px; }
+        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height:0; background:transparent; }
+        QScrollBar:horizontal { background:transparent; height:16px; margin:0; }
+        QScrollBar::handle:horizontal { background:#2F74D0; border-radius:4px; min-width:48px; margin:5px 0; }
+        QScrollBar::handle:horizontal:hover { background:#4D96F5; }
+        QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background:#252C36; border-radius:2px; margin:6px 0; }
+        QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width:0; background:transparent; }
         """)
 
     def _browse_hython(self):
