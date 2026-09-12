@@ -343,7 +343,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.list.setObjectName("dropList")
         self.progress = QtWidgets.QProgressBar()
         self.log = QtWidgets.QPlainTextEdit()
-        self.start_btn = QtWidgets.QPushButton("开始依次打包")
+        self.start_btn = QtWidgets.QPushButton("开始打包")
         self.start_btn.setObjectName("primaryButton")
         self.stop_btn = QtWidgets.QPushButton("停止")
         self.stop_btn.setObjectName("stopButton")
@@ -531,7 +531,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.progress.setValue(0)
 
     def _set_packaging_ui(self, active):
-        self.start_btn.setText("打包中" if active else "开始依次打包")
+        self.start_btn.setText("打包中" if active else "开始打包")
         self.start_btn.setEnabled(not active)
         self.stop_btn.setProperty("packagingActive", active)
         self.stop_btn.setEnabled(active)
@@ -549,7 +549,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not tasks:
             QtWidgets.QMessageBox.information(self, "没有任务", "请把 HIP 文件拖进窗口。")
             return
-        self.progress.setValue(0); self.log.appendPlainText("开始依次打包，共 %d 个 HIP。" % len(tasks))
+        self.progress.setValue(0); self.log.appendPlainText("开始打包，共 %d 个 HIP。" % len(tasks))
         for i in range(self.list.count()): self.list.item(i).setText(tasks[i] + "    [等待]")
         self._set_packaging_ui(True)
         categories = {name for name, checkbox in self.category_cbs.items() if checkbox.isChecked()}
