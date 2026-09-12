@@ -237,11 +237,12 @@ class ArchiveWorker(threading.Thread):
                 if attempt > 1:
                     self.events.put(("log", f"第 {attempt}/{self.MAX_ATTEMPTS} 次重试：{hip}"))
                 # Never accept a manifest left by an earlier attempt. Removing
-                # this tiny status file does not touch already copied assets.
+                # these tiny status files does not touch already copied assets.
                 try:
                     manifest_path.unlink(missing_ok=True)
+                    (package_dir / "archive_log.txt").unlink(missing_ok=True)
                 except Exception as exc:
-                    self.events.put(("log", f"无法清理旧校验文件：{exc}"))
+                    self.events.put(("log", f"无法清理旧结果文件：{exc}"))
                     code = -1
                     manifest = None
                     if attempt < self.MAX_ATTEMPTS:

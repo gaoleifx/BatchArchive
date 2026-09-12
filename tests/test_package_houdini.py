@@ -122,6 +122,10 @@ class PackageDirectoryTests(unittest.TestCase):
             manifest = json.loads((package_dir / "package_manifest.json").read_text(encoding="utf-8"))
             self.assertIn("resources", manifest)
             self.assertEqual(manifest["summary"]["resources_copied"], 0)
+            archive_log = (package_dir / "archive_log.txt").read_text(encoding="utf-8-sig")
+            self.assertIn("结果：成功", archive_log)
+            self.assertIn("- scene.hip", archive_log)
+            self.assertIn("- 无外部资源", archive_log)
 
     def test_external_alembic_file_copies_and_reuses_its_parent_folder(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -155,6 +159,9 @@ class PackageDirectoryTests(unittest.TestCase):
             self.assertTrue(file_parm.evalAsString().endswith("/character_a.abc"))
             file_resource = next(item for item in resources if item.get("copied_parent_directory"))
             self.assertTrue(file_resource["folder_reused"])
+            archive_log = (package_dir / "archive_log.txt").read_text(encoding="utf-8-sig")
+            self.assertIn("分类：Alembics 2", archive_log)
+            self.assertEqual(archive_log.count("- abc/"), 1)
 
     def test_missing_resource_is_not_retried(self):
         manifest = {"status": "failed", "failures": [{"reason": "not_found"}]}

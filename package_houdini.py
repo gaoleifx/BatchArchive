@@ -20,6 +20,49 @@ def norm(p):
     return os.path.normcase(os.path.abspath(os.path.normpath(p)))
 
 
+def build_archive_log(data):
+    """Return a short, human-readable summary of one archive run."""
+    summary = data.get("summary") or {}
+    filtered = summary.get("filtered") or {}
+    result = "成功" if data.get("status") == "success" else "失败"
+    lines = [
+        "Houdini 归档记录",
+        "结果：%s" % result,
+        "源工程：%s" % (data.get("source") or "-"),
+        "归档工程：%s" % (data.get("package") or "-"),
+        "资源：复制 %d，改写路径 %d，失败 %d，跳过 %d" % (
+            summary.get("resources_copied", 0),
+            summary.get("parameters_rewritten", 0),
+            summary.get("failed", 0),
+            sum(filtered.values()),
+        ),
+    ]
+
+    category_counts = summary.get("category_counts") or {}
+    if category_counts:
+        lines.append("分类：" + "，".join("%s %s" % item for item in sorted(category_counts.items())))
+
+    exported = []
+    seen = set()
+    for item in data.get("resources") or []:
+        target = item.get("storage_directory") if item.get("copied_parent_directory") else item.get("target")
+        if target and target not in seen:
+            seen.add(target)
+            exported.append(target)
+    lines.extend(["", "导出内容：", "- " + os.path.basename(data.get("package") or "归档工程")])
+    lines.extend("- " + target for target in exported)
+    if not exported:
+        lines.append("- 无外部资源")
+
+    failures = data.get("failures") or []
+    if failures:
+        lines.extend(["", "失败项："])
+        for failure in failures:
+            subject = failure.get("resource") or failure.get("parameter") or failure.get("node") or "未知项目"
+            lines.append("- %s（%s）" % (subject, failure.get("reason") or "unknown"))
+    return "\n".join(lines) + "\n"
+
+
 def package(source, archive_root, skip_cache_outputs=True, skip_render_outputs=True, categories=None, filter_red_nodes=False, filter_external_nodes=False, exclude_renderer_nodes=True, fixed_package_dir=None):
     source = os.path.abspath(source)
     source_dir = os.path.dirname(source)
@@ -506,6 +549,13 @@ def package(source, archive_root, skip_cache_outputs=True, skip_render_outputs=T
         "resources": manifest,
         "failures": failures,
     }
+    archive_log_path = os.path.join(package_dir, "archive_log.txt")
+    archive_log_temp_path = archive_log_path + ".tmp"
+    with open(archive_log_temp_path, "w", encoding="utf-8-sig", newline="\n") as f:
+        f.write(build_archive_log(data))
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(archive_log_temp_path, archive_log_path)
     manifest_temp_path = manifest_path + ".tmp"
     with open(manifest_temp_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)

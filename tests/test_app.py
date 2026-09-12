@@ -165,6 +165,7 @@ counter.write_text(str(attempt))
 if attempt == 1:
     manifest = {'status': 'failed', 'failures': [{'reason': 'copy_failed'}]}
     (package_dir / 'package_manifest.json').write_text(json.dumps(manifest))
+    (package_dir / 'archive_log.txt').write_text('stale result')
 elif attempt == 3:
     package = package_dir / pathlib.Path(sys.argv[1]).name
     package.write_bytes(b'packaged hip')
@@ -186,6 +187,7 @@ elif attempt == 3:
             package_dir = root / "archive" / "scene"
             records, _ = self._event_text(events)
             self.assertEqual((package_dir / "attempts.txt").read_text(), "3")
+            self.assertFalse((package_dir / "archive_log.txt").exists())
             self.assertIn(("item", 0, "完成"), records)
 
     def test_three_transient_failures_end_as_failed(self):
