@@ -27,14 +27,10 @@ def package(source, archive_root, skip_cache_outputs=True, skip_render_outputs=T
     os.makedirs(archive_root, exist_ok=True)
     if fixed_package_dir:
         package_dir = os.path.abspath(fixed_package_dir)
-        if os.path.exists(package_dir):
-            for entry in os.scandir(package_dir):
-                if entry.is_dir(follow_symlinks=False):
-                    shutil.rmtree(entry.path)
-                else:
-                    os.unlink(entry.path)
-        else:
-            os.makedirs(package_dir)
+        # A fixed directory is reused by GUI retry attempts. Keep resources
+        # already copied by the preceding attempt so a retry cannot destroy a
+        # nearly complete package or repeat large transfers.
+        os.makedirs(package_dir, exist_ok=True)
     else:
         package_dir = os.path.join(archive_root, stem)
         idx = 2
@@ -66,11 +62,24 @@ def package(source, archive_root, skip_cache_outputs=True, skip_render_outputs=T
     def copy_item(src, dst):
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         if os.path.isdir(src):
-            if not os.path.exists(dst):
-                shutil.copytree(src, dst)
+            copied_files = 0
+            for current_root, dir_names, file_names in os.walk(src):
+                relative_root = os.path.relpath(current_root, src)
+                target_root = dst if relative_root == "." else os.path.join(dst, relative_root)
+                os.makedirs(target_root, exist_ok=True)
+                for dir_name in dir_names:
+                    os.makedirs(os.path.join(target_root, dir_name), exist_ok=True)
+                for file_name in file_names:
+                    copied_files += copy_item(
+                        os.path.join(current_root, file_name),
+                        os.path.join(target_root, file_name),
+                    )
+            return copied_files
         elif os.path.isfile(src):
             if not os.path.exists(dst) or os.path.getsize(dst) != os.path.getsize(src):
                 shutil.copy2(src, dst)
+                return 1
+        return 0
 
     def safe_name(p):
         return re.sub(r"[^A-Za-z0-9._-]+", "_", os.path.basename(p)) or "resource"
@@ -127,6 +136,18 @@ def package(source, archive_root, skip_cache_outputs=True, skip_render_outputs=T
             return "Image/Textures"
         return None
 
+    def classify_directory_resource(expanded):
+        """Classify a directory from the resources it directly contains."""
+        if not os.path.isdir(expanded):
+            return None
+        try:
+            extensions = {Path(entry.name).suffix.lower() for entry in os.scandir(expanded) if entry.is_file()}
+        except OSError:
+            return None
+        if ".abc" in extensions:
+            return "Alembics"
+        return None
+
     category_dirs = {"Image/Textures": "textures", "Geometry": "geo", "Alembics": "abc", "USDs": "usd", "HDAs": "otls"}
 
     def storage_info(expanded, category, directory_hint=False):
@@ -138,9 +159,10 @@ def package(source, archive_root, skip_cache_outputs=True, skip_render_outputs=T
         source_path = norm(expanded)
         source_dir_for_hash = source_path if directory_hint or os.path.isdir(expanded) else os.path.dirname(source_path)
         source_hash = hashlib.sha1(source_dir_for_hash.encode("utf-8", "replace")).hexdigest()[:8]
+        source_folder = safe_name(source_dir_for_hash)
+        collision_group = "%s_%s" % (source_folder, source_hash)
         if category in category_dirs:
             root = category_dirs[category]
-            collision_group = "external_%s" % source_hash
             if directory_hint or os.path.isdir(expanded):
                 target = "%s/%s" % (root, collision_group)
                 storage_directory = target
@@ -148,9 +170,9 @@ def package(source, archive_root, skip_cache_outputs=True, skip_render_outputs=T
                 target = "%s/%s/%s" % (root, collision_group, safe_name(expanded))
                 storage_directory = "%s/%s" % (root, collision_group)
             return {"target": target, "storage_category": category, "storage_directory": storage_directory, "source_is_external": True, "source_hash": source_hash, "collision_group": collision_group}
-        collision_group = source_hash
-        target = "external/%s/%s" % (source_hash, safe_name(expanded))
-        return {"target": target, "storage_category": None, "storage_directory": "external/%s" % source_hash, "source_is_external": True, "source_hash": source_hash, "collision_group": collision_group}
+        storage_directory = "external/%s" % collision_group
+        target = storage_directory if directory_hint or os.path.isdir(expanded) else "%s/%s" % (storage_directory, safe_name(expanded))
+        return {"target": target, "storage_category": None, "storage_directory": storage_directory, "source_is_external": True, "source_hash": source_hash, "collision_group": collision_group}
 
     def is_red_node(parm):
         if parm is None:
@@ -294,6 +316,7 @@ def package(source, archive_root, skip_cache_outputs=True, skip_render_outputs=T
     emit("status", message="扫描到 %d 个文件引用" % len(refs))
     manifest, missing = [], []
     failures = []
+    copied_folder_targets = set()
     verified = 0
     copied = rewritten = 0
     filtered_cache = filtered_render = filtered_renderer = 0
@@ -332,7 +355,7 @@ def package(source, archive_root, skip_cache_outputs=True, skip_render_outputs=T
             manifest.append({"parm": parm.path() if parm else None, "raw": raw, "kind": kind or "output_directory_skipped"})
             emit("status", message="过滤 %s：%s" % (kind or "输出目录", parm.path() if parm else raw))
             continue
-        category = classify_resource(raw, expanded)
+        category = classify_resource(raw, expanded) or classify_directory_resource(expanded)
         red_node = is_red_node(parm)
         external_node = is_external(expanded)
         if category:
@@ -374,8 +397,7 @@ def package(source, archive_root, skip_cache_outputs=True, skip_render_outputs=T
             emit("status", message="复制序列：%s（%d 个文件）" % (rel_dir, len(matches)))
             try:
                 for match in matches:
-                    copy_item(match, os.path.join(package_dir, rel_dir, os.path.basename(match)))
-                    copied += 1
+                    copied += copy_item(match, os.path.join(package_dir, rel_dir, os.path.basename(match)))
             except Exception as exc:
                 failures.append({"node": parm.node().path() if parm else None, "parameter": parm.path() if parm else None, "resource": raw, "target": rel_dir, "reason": "copy_failed", "detail": str(exc)})
                 emit("status", message="复制失败：%s" % raw)
@@ -407,8 +429,20 @@ def package(source, archive_root, skip_cache_outputs=True, skip_render_outputs=T
             else:
                 emit("status", message="复制资源：%s -> %s" % (expanded, rel))
             target_path = os.path.join(package_dir, rel.replace("/", os.sep))
+            copy_source = expanded
+            copy_target = target_path
+            copied_parent_directory = False
+            if storage_meta.get("source_is_external") and category == "Alembics" and os.path.isfile(expanded):
+                copy_source = os.path.dirname(expanded)
+                copy_target = os.path.dirname(target_path)
+                copied_parent_directory = True
+                emit("status", message="按文件夹复制 Alembic：%s -> %s" % (copy_source, storage_meta.get("storage_directory")))
+            folder_copy_key = (norm(copy_source), norm(copy_target)) if os.path.isdir(copy_source) else None
+            folder_reused = folder_copy_key in copied_folder_targets if folder_copy_key else False
             try:
-                copy_item(expanded, target_path)
+                copied_now = 0 if folder_reused else copy_item(copy_source, copy_target)
+                if folder_copy_key:
+                    copied_folder_targets.add(folder_copy_key)
             except Exception as exc:
                 failures.append({"node": parm.node().path() if parm else None, "parameter": parm.path() if parm else None, "resource": raw, "target": rel, "reason": "copy_failed", "detail": str(exc)})
                 emit("status", message="复制失败：%s" % expanded)
@@ -416,9 +450,13 @@ def package(source, archive_root, skip_cache_outputs=True, skip_render_outputs=T
             if not os.path.exists(target_path):
                 failures.append({"node": parm.node().path() if parm else None, "parameter": parm.path() if parm else None, "resource": raw, "target": rel, "reason": "target_missing"})
                 continue
-            copied += 1
+            copied += copied_now
             item = dict(item_meta)
             item["target"] = rel
+            if copied_parent_directory:
+                item["copied_parent_directory"] = True
+                item["source_parent"] = copy_source
+                item["folder_reused"] = folder_reused
             if parm is not None and (os.path.isabs(raw) or expanded != raw):
                 if not (inside(expanded) and ("$HIP" in raw or "$JOB" in raw)):
                     hip_rel = "$HIP/" + rel.lstrip("/")
@@ -465,10 +503,15 @@ def package(source, archive_root, skip_cache_outputs=True, skip_render_outputs=T
             "category_counts": category_counts,
             "not_found": len(missing),
         },
+        "resources": manifest,
         "failures": failures,
     }
-    with open(manifest_path, "w", encoding="utf-8") as f:
+    manifest_temp_path = manifest_path + ".tmp"
+    with open(manifest_temp_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(manifest_temp_path, manifest_path)
     emit("done", package=dest, manifest=manifest_path, status=status, failures=len(failures), resources_copied=copied, parameters_rewritten=rewritten, filtered_cache_outputs=filtered_cache, filtered_render_outputs=filtered_render, filtered_renderer_nodes=filtered_renderer, filtered_category=filtered_category, filtered_node_rule=filtered_node, category_counts=category_counts, not_found=len(missing))
 
 

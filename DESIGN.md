@@ -18,6 +18,7 @@
 - 2026-08-24 — packaging runs in a worker Houdini process and never edits source HIP.
 - 2026-08-24 — Houdini selector lists all detected installations and synchronizes the hython path.
 - 2026-08-24 — added two-level resource and node filtering in a collapsible right panel.
+- 2026-09-11 — packaging action state: the disabled start button reads “打包中” while the stop button takes the brand-blue primary treatment; both return to idle styling when the worker finishes.
 
 ## Components
 - Archive window
@@ -25,3 +26,4 @@
 - Latest HIP scanner
 - Progress log
 - Result summary
+- Packaging action button states (`app.py`)

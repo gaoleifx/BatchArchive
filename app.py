@@ -10,6 +10,8 @@ from pathlib import Path
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
+from archive_policy import is_valid_success, should_retry
+
 
 APP_DIR = Path(__file__).resolve().parent
 PACKAGE_SCRIPT = APP_DIR / "package_houdini.py"
@@ -54,11 +56,15 @@ class DropList(QtWidgets.QListWidget):
     def add_path(self, path):
         path = os.path.abspath(path)
         if os.path.isfile(path) and path.lower().endswith(HIP_EXTS):
-            if not self.findItems(path, QtCore.Qt.MatchExactly):
-                self.addItem(path)
+            known_paths = {os.path.normcase(existing) for existing in self.paths()}
+            if os.path.normcase(path) not in known_paths:
+                item = QtWidgets.QListWidgetItem(path)
+                item.setData(QtCore.Qt.UserRole, path)
+                self.addItem(item)
 
     def paths(self):
-        return [self.item(i).text() for i in range(self.count())]
+        return [self.item(i).data(QtCore.Qt.UserRole) or self.item(i).text().rsplit("    [", 1)[0]
+                for i in range(self.count())]
 
     def paintEvent(self, event):
         super().paintEvent(event)
@@ -230,6 +236,19 @@ class ArchiveWorker(threading.Thread):
                     break
                 if attempt > 1:
                     self.events.put(("log", f"第 {attempt}/{self.MAX_ATTEMPTS} 次重试：{hip}"))
+                # Never accept a manifest left by an earlier attempt. Removing
+                # this tiny status file does not touch already copied assets.
+                try:
+                    manifest_path.unlink(missing_ok=True)
+                except Exception as exc:
+                    self.events.put(("log", f"无法清理旧校验文件：{exc}"))
+                    code = -1
+                    manifest = None
+                    if attempt < self.MAX_ATTEMPTS:
+                        self.events.put(("log", f"第 {attempt} 次无法建立安全校验状态，准备重试。"))
+                        continue
+                    self.events.put(("log", f"已达到最多 {self.MAX_ATTEMPTS} 次尝试：无法安全更新校验文件。"))
+                    break
                 try:
                     env = os.environ.copy()
                     env["PYTHONUNBUFFERED"] = "1"
@@ -251,6 +270,8 @@ class ArchiveWorker(threading.Thread):
                     code = -1
                     self.events.put(("log", "启动失败：" + str(exc)))
                 finally:
+                    if self.process and self.process.stdout:
+                        self.process.stdout.close()
                     self.process = None
 
                 try:
@@ -260,18 +281,28 @@ class ArchiveWorker(threading.Thread):
                     manifest = None
                     self.events.put(("log", f"第 {attempt} 次校验失败：JSON 不存在或无法解析（{exc}）"))
 
-                if code == 0 and manifest and manifest.get("status") == "success" and not manifest.get("failures"):
+                if self.stop_requested:
                     break
+                nominal_success = code == 0 and manifest and manifest.get("status") == "success" and not manifest.get("failures")
+                if nominal_success and is_valid_success(code, manifest, hip_path, package_dir):
+                    break
+                if nominal_success:
+                    self.events.put(("log", f"第 {attempt} 次校验失败：成功清单与当前任务或归档 HIP 不匹配。"))
+                    manifest = None
                 failure_count = len(manifest.get("failures", [])) if manifest else 0
                 reason = f"{failure_count} 个失败项" if manifest else f"进程退出码 {code}"
-                if attempt < self.MAX_ATTEMPTS:
+                retryable = should_retry(code, manifest)
+                if attempt < self.MAX_ATTEMPTS and retryable:
                     self.events.put(("log", f"第 {attempt} 次打包未通过 JSON 校验：{reason}，准备重试。"))
+                elif attempt < self.MAX_ATTEMPTS:
+                    self.events.put(("log", f"第 {attempt} 次打包发现确定性错误：{reason}，停止无效重试。"))
+                    break
                 else:
                     self.events.put(("log", f"已达到最多 {self.MAX_ATTEMPTS} 次尝试：{reason}"))
             if self.stop_requested:
                 self.events.put(("item", index - 1, "已停止"))
                 break
-            success = code == 0 and manifest and manifest.get("status") == "success" and not manifest.get("failures")
+            success = is_valid_success(code, manifest, hip_path, package_dir)
             state = "完成" if success else "失败"
             self.events.put(("item", index - 1, state))
             self.events.put(("progress", int(index * 100 / total)))
@@ -314,6 +345,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.start_btn = QtWidgets.QPushButton("开始依次打包")
         self.start_btn.setObjectName("primaryButton")
         self.stop_btn = QtWidgets.QPushButton("停止")
+        self.stop_btn.setObjectName("stopButton")
+        self.stop_btn.setProperty("packagingActive", False)
         self._build_ui()
         self._style()
         self.timer = QtCore.QTimer(self)
@@ -359,7 +392,7 @@ class MainWindow(QtWidgets.QMainWindow):
         controls = QtWidgets.QHBoxLayout()
         add_btn = QtWidgets.QPushButton("添加文件"); add_btn.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_FileIcon)); add_btn.clicked.connect(self._add_files)
         remove_btn = QtWidgets.QPushButton("删除选中"); remove_btn.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_TrashIcon)); remove_btn.clicked.connect(self._remove_selected)
-        clear_btn = QtWidgets.QPushButton("清空"); clear_btn.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_DialogResetButton)); clear_btn.clicked.connect(self.list.clear)
+        clear_btn = QtWidgets.QPushButton("清空"); clear_btn.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_DialogResetButton)); clear_btn.clicked.connect(self._clear_all)
         controls.addWidget(add_btn); controls.addWidget(remove_btn); controls.addWidget(clear_btn); controls.addStretch(1)
         self.start_btn.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_MediaPlay)); self.stop_btn.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_MediaStop))
         self.start_btn.clicked.connect(self._start); self.stop_btn.clicked.connect(self._stop); self.stop_btn.setEnabled(False)
@@ -428,7 +461,12 @@ class MainWindow(QtWidgets.QMainWindow):
         QPushButton#primaryButton { background:#1677FF; border:1px solid #1677FF; color:#FFFFFF; font-weight:600; padding:9px 16px; }
         QPushButton#primaryButton:hover { background:#4096FF; border-color:#4096FF; }
         QPushButton#primaryButton:pressed { background:#0958D9; border-color:#0958D9; }
+        QPushButton#stopButton[packagingActive="true"] { background:#1677FF; border:1px solid #1677FF; color:#FFFFFF; font-weight:600; padding:9px 16px; }
+        QPushButton#stopButton[packagingActive="true"]:hover { background:#4096FF; border-color:#4096FF; }
+        QPushButton#stopButton[packagingActive="true"]:pressed { background:#0958D9; border-color:#0958D9; }
+        QPushButton#primaryButton:focus, QPushButton#stopButton[packagingActive="true"]:focus { border:2px solid #8BB9FF; padding:8px 15px; }
         QPushButton:disabled { color:#687482; background:#151B23; border-color:#2A323C; }
+        QPushButton#primaryButton:disabled { color:#7B8794; background:#202833; border-color:#303A46; }
         QProgressBar { background:#0F141A; border:1px solid #303944; border-radius:5px; text-align:center; color:#E6EDF3; height:9px; }
         QProgressBar::chunk { background:#1677FF; border-radius:4px; }
         QSplitter::handle { background:#252D36; width:1px; }
@@ -485,6 +523,21 @@ class MainWindow(QtWidgets.QMainWindow):
         for item in self.list.selectedItems():
             self.list.takeItem(self.list.row(item))
 
+    def _clear_all(self):
+        self.list.clear()
+        self.log.clear()
+        if not (self.worker and self.worker.is_alive()):
+            self.progress.setValue(0)
+
+    def _set_packaging_ui(self, active):
+        self.start_btn.setText("打包中" if active else "开始依次打包")
+        self.start_btn.setEnabled(not active)
+        self.stop_btn.setProperty("packagingActive", active)
+        self.stop_btn.setEnabled(active)
+        self.stop_btn.style().unpolish(self.stop_btn)
+        self.stop_btn.style().polish(self.stop_btn)
+        self.stop_btn.update()
+
     def _start(self):
         if self.worker and self.worker.is_alive(): return
         hython = self.hython_edit.text().strip()
@@ -497,12 +550,12 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self.progress.setValue(0); self.log.appendPlainText("开始依次打包，共 %d 个 HIP。" % len(tasks))
         for i in range(self.list.count()): self.list.item(i).setText(tasks[i] + "    [等待]")
-        self.start_btn.setEnabled(False); self.stop_btn.setEnabled(True)
+        self._set_packaging_ui(True)
         categories = {name for name, checkbox in self.category_cbs.items() if checkbox.isChecked()}
         self.worker = ArchiveWorker(tasks, hython, self.output_edit.text().strip(), self.skip_cache_cb.isChecked(), self.skip_render_cb.isChecked(), categories, self.red_node_cb.isChecked(), self.external_node_cb.isChecked(), self.events); self.worker.start()
 
     def _stop(self):
-        if self.worker: self.worker.stop(); self.log.appendPlainText("已请求停止，当前 HIP 完成后结束。")
+        if self.worker: self.worker.stop(); self.log.appendPlainText("已请求停止，正在终止当前 HIP。")
 
     def _poll(self):
         while True:
@@ -519,7 +572,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.list.item(i).setText(base + "    [" + state + "]")
             elif kind == "progress": self.progress.setValue(event[1])
             elif kind == "finished":
-                self.start_btn.setEnabled(True); self.stop_btn.setEnabled(False); self.worker = None
+                self._set_packaging_ui(False); self.worker = None
                 self.log.appendPlainText("队列处理完成。")
 
 
