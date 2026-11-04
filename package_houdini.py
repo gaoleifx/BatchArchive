@@ -20,6 +20,19 @@ def norm(p):
     return os.path.normcase(os.path.abspath(os.path.normpath(p)))
 
 
+# Scripts, configs and documents that a scene may point at but that are not
+# assets. They are skipped by default; --include-auxiliary-files keeps them.
+AUXILIARY_EXTENSIONS = {
+    ".json", ".py", ".pyc", ".pyo", ".txt", ".log", ".md",
+    ".xml", ".yaml", ".yml", ".csv", ".ini", ".cfg", ".toml",
+    ".bat", ".cmd", ".sh", ".ps1",
+}
+
+
+def is_auxiliary_file(path):
+    return os.path.splitext(str(path))[1].lower() in AUXILIARY_EXTENSIONS
+
+
 def build_archive_log(data):
     """Return a short, human-readable summary of one archive run."""
     summary = data.get("summary") or {}
@@ -63,7 +76,7 @@ def build_archive_log(data):
     return "\n".join(lines) + "\n"
 
 
-def package(source, archive_root, skip_cache_outputs=True, skip_render_outputs=True, categories=None, filter_red_nodes=False, filter_external_nodes=False, exclude_renderer_nodes=True, fixed_package_dir=None):
+def package(source, archive_root, skip_cache_outputs=True, skip_render_outputs=True, categories=None, filter_red_nodes=False, filter_external_nodes=False, exclude_renderer_nodes=True, fixed_package_dir=None, skip_auxiliary_files=True):
     source = os.path.abspath(source)
     source_dir = os.path.dirname(source)
     stem = Path(source).stem
@@ -90,6 +103,13 @@ def package(source, archive_root, skip_cache_outputs=True, skip_render_outputs=T
         except ValueError:
             return False
 
+    def covers_source_root(p):
+        """True when p is the project folder or one of its ancestors."""
+        try:
+            return os.path.commonpath([source_norm, norm(p)]) == norm(p)
+        except ValueError:
+            return False
+
     def standard_rel(p):
         """Keep resources under a Houdini project standard folder in that folder."""
         parts = list(Path(os.path.normpath(p)).parts)
@@ -102,7 +122,10 @@ def package(source, archive_root, skip_cache_outputs=True, skip_render_outputs=T
         q = norm(p)
         return q.startswith(norm(r"C:\Program Files\Side Effects Software")) or q.startswith(norm(r"C:\PROGRA~1\SIDEEF~1"))
 
+    folder_auxiliary_skipped = 0
+
     def copy_item(src, dst):
+        nonlocal folder_auxiliary_skipped
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         if os.path.isdir(src):
             copied_files = 0
@@ -113,6 +136,9 @@ def package(source, archive_root, skip_cache_outputs=True, skip_render_outputs=T
                 for dir_name in dir_names:
                     os.makedirs(os.path.join(target_root, dir_name), exist_ok=True)
                 for file_name in file_names:
+                    if skip_auxiliary_files and is_auxiliary_file(file_name):
+                        folder_auxiliary_skipped += 1
+                        continue
                     copied_files += copy_item(
                         os.path.join(current_root, file_name),
                         os.path.join(target_root, file_name),
@@ -121,7 +147,10 @@ def package(source, archive_root, skip_cache_outputs=True, skip_render_outputs=T
         elif os.path.isfile(src):
             if not os.path.exists(dst) or os.path.getsize(dst) != os.path.getsize(src):
                 shutil.copy2(src, dst)
-                return 1
+            # A file that is already in place (same size) still counts as an
+            # archived resource, so a retry reusing the package directory does
+            # not under-report resources_copied.
+            return 1
         return 0
 
     def safe_name(p):
@@ -166,16 +195,6 @@ def package(source, archive_root, skip_cache_outputs=True, skip_render_outputs=T
         if "geo" in path_markers or "geometry" in path_markers:
             return "Geometry"
         if "textures" in path_markers or "texture" in path_markers:
-            return "Image/Textures"
-        if text.endswith((".hda", ".hdalc", ".hdanc")) or "/otls/" in text:
-            return "HDAs"
-        if text.endswith((".usd", ".usda", ".usdc", ".usdz")):
-            return "USDs"
-        if text.endswith(".abc"):
-            return "Alembics"
-        if text.endswith((".bgeo", ".bgeo.sc", ".sim", ".vdb", ".pc", ".pdc", ".obj", ".fbx", ".ply", ".stl")):
-            return "Geometry"
-        if text.endswith((".jpg", ".jpeg", ".png", ".tif", ".tiff", ".exr", ".hdr", ".rat", ".tx", ".bmp", ".gif")):
             return "Image/Textures"
         return None
 
@@ -245,13 +264,23 @@ def package(source, archive_root, skip_cache_outputs=True, skip_render_outputs=T
             parm_name = parm.name().lower()
             category = node.type().category().name().lower()
             text = " ".join((node_type, node_name, parm_name, str(raw).lower()))
-            renderer_words = ("render", "mantra", "karma", "arnold", "redshift", "renderman", "usdrender", "vray", "octane")
+            renderer_words = ("mantra", "karma", "arnold", "redshift", "renderman", "usdrender", "vray", "octane")
             render_parms = ("outputimage", "vm_picture", "picture", "soho_output", "output_file", "renderoutput", "cryptopicture")
             # Render Gallery is stored on /stage as a Manager node, not as a
             # Driver/LOP renderer node. Treat its source parameter/database as
             # renderer metadata and exclude the whole node from the archive.
             gallery_ref = is_render_gallery_reference(parm, raw)
-            return gallery_ref or (category in {"driver", "lop"} and any(word in text for word in renderer_words)) or any(word in node_type for word in renderer_words) or parm_name in render_parms
+            # "render" alone is too broad as a substring: many non-renderer
+            # nodes carry it in their type name. Only treat a bare "render"
+            # as a renderer signal when the node already lives in a
+            # driver/lop category, otherwise require a concrete renderer
+            # brand or a render output parameter.
+            return (
+                gallery_ref
+                or (category in {"driver", "lop"} and ("render" in text or any(word in text for word in renderer_words)))
+                or any(word in node_type for word in renderer_words)
+                or parm_name in render_parms
+            )
         except Exception:
             return False
 
@@ -281,7 +310,6 @@ def package(source, archive_root, skip_cache_outputs=True, skip_render_outputs=T
             category = node.type().category().name().lower()
         except Exception:
             category = ""
-        text = " ".join((node_type, node_name, parm_name, raw.lower()))
         filecache_node = is_filecache_node(node)
         if filecache_node:
             # File Cache 2.0 exposes many helper parameters as file
@@ -292,7 +320,7 @@ def package(source, archive_root, skip_cache_outputs=True, skip_render_outputs=T
                 return "cache_auxiliary"
             if skip_cache_outputs and filecache_has_input(node):
                 return "cache_output"
-        cache_node = (not filecache_node) and any(x in text for x in ("filecache", "rop_geometry", "geometrycache", "dopimport", "alembiccache"))
+        cache_node = (not filecache_node) and any(x in node_type for x in ("filecache", "rop_geometry", "geometrycache", "dopimport", "alembiccache"))
         cache_parm = (not filecache_node) and parm_name in {"basedir", "filepattern", "cachefile", "cachefilename", "simfile", "sopoutput"}
         render_node = is_renderer_node(parm, raw)
         render_parm = parm_name in {"outputimage", "vm_picture", "picture", "cryptopicture", "soho_output", "output_file", "renderoutput"}
@@ -340,22 +368,24 @@ def package(source, archive_root, skip_cache_outputs=True, skip_render_outputs=T
     refs = list(refs)
     ref_parm_paths = {parm.path() for parm, _ in refs if parm is not None}
     filecache_outputs = 0
-    for node in hou.node("/").allSubChildren():
-        node_type = node.type().name().lower()
-        if not node_type.startswith("filecache"):
-            continue
-        output_parm = node.parm("sopoutput")
-        if output_parm is None or output_parm.path() in ref_parm_paths:
-            continue
-        try:
-            output_value = output_parm.evalAsString()
-        except Exception:
-            output_value = ""
-        if output_value:
-            refs.append((output_parm, output_value))
-            ref_parm_paths.add(output_parm.path())
-            filecache_outputs += 1
-            emit("status", message="识别 File Cache 输出：%s -> %s" % (node.path(), output_value))
+    root_node = hou.node("/")
+    if root_node is not None:
+        for node in root_node.allSubChildren():
+            node_type = node.type().name().lower()
+            if not node_type.startswith("filecache"):
+                continue
+            output_parm = node.parm("sopoutput")
+            if output_parm is None or output_parm.path() in ref_parm_paths:
+                continue
+            try:
+                output_value = output_parm.evalAsString()
+            except Exception:
+                output_value = ""
+            if output_value:
+                refs.append((output_parm, output_value))
+                ref_parm_paths.add(output_parm.path())
+                filecache_outputs += 1
+                emit("status", message="识别 File Cache 输出：%s -> %s" % (node.path(), output_value))
     emit("status", message="扫描到 %d 个文件引用" % len(refs))
     manifest, missing = [], []
     failures = []
@@ -363,7 +393,8 @@ def package(source, archive_root, skip_cache_outputs=True, skip_render_outputs=T
     verified = 0
     copied = rewritten = 0
     filtered_cache = filtered_render = filtered_renderer = 0
-    filtered_category = filtered_node = 0
+    filtered_category = filtered_node = filtered_project_dirs = filtered_auxiliary = 0
+    alembic_dir_refs = []
     category_counts = {}
     render_gallery_node_paths = set()
     if exclude_renderer_nodes:
@@ -405,6 +436,12 @@ def package(source, archive_root, skip_cache_outputs=True, skip_render_outputs=T
             category_counts[category] = category_counts.get(category, 0) + 1
         storage_meta = storage_info(expanded, category) if os.path.isabs(expanded) else {"target": None, "storage_category": category, "storage_directory": None, "source_is_external": False, "source_hash": None, "collision_group": None}
         item_meta = {"parm": parm.path() if parm else None, "raw": raw, "expanded": expanded, "category": category, "red_node": red_node, "renderer_node": renderer_node, "external_resource": external_node, **storage_meta}
+        if skip_auxiliary_files and not os.path.isdir(expanded) and is_auxiliary_file(expanded):
+            item_meta["filtered_by"] = "auxiliary_file"
+            manifest.append(item_meta)
+            filtered_auxiliary += 1
+            emit("status", message="跳过脚本/配置文件：%s" % (parm.path() if parm else expanded))
+            continue
         if category and categories is not None and category not in categories:
             item_meta["filtered_by"] = "category"
             manifest.append(item_meta)
@@ -419,7 +456,22 @@ def package(source, archive_root, skip_cache_outputs=True, skip_render_outputs=T
                 filtered_node += 1
                 emit("status", message="按节点规则过滤：%s | red=%s external=%s" % (parm.path() if parm else raw, red_node, external_node))
                 continue
-        if expanded.startswith(("temp:", "op:")) or not os.path.isabs(expanded):
+        if expanded.startswith(("temp:", "op:", "opdef:", "oplib:")):
+            # Houdini internal node/temporary references are not real file
+            # assets and should never be copied into the archive.
+            continue
+        if not os.path.isabs(expanded):
+            # A path that is still not absolute after evaluation can be either
+            # a project-relative reference (fine to skip) or an environment
+            # variable that expandString() failed to resolve (a real gap in
+            # the archive). Flag the unresolved variable so it never slips
+            # through silently.
+            if "$" in expanded or "%" in expanded:
+                unresolved_item = dict(item_meta)
+                unresolved_item["kind"] = "unresolved_path"
+                manifest.append(unresolved_item)
+                failures.append({"node": node_path, "parameter": parm.path() if parm else None, "resource": raw, "target": None, "reason": "unresolved_path"})
+                emit("status", message="路径包含未解析变量，无法归档：%s" % raw)
             continue
         if builtin(expanded):
             builtin_item = dict(item_meta)
@@ -464,7 +516,40 @@ def package(source, archive_root, skip_cache_outputs=True, skip_render_outputs=T
             continue
 
         if os.path.exists(expanded):
+            if os.path.isdir(expanded) and covers_source_root(expanded):
+                # Path parameters point at the project folder more often than
+                # expected (PDG working directories, $JOB style roots).
+                # Copying such a folder would drag every other scene, backup
+                # and cache in the project into the package, so record the
+                # reference, keep its value untouched and skip the copy.
+                root_item = dict(item_meta)
+                root_item["kind"] = "project_directory_skipped"
+                manifest.append(root_item)
+                filtered_project_dirs += 1
+                emit("status", message="跳过工程目录引用，不复制整个工程：%s" % (parm.path() if parm else expanded))
+                continue
             rel = storage_meta["target"]
+            if os.path.isdir(expanded) and category == "Alembics":
+                # An Alembic folder parameter (a python node root, for
+                # example) used to pull in every .abc stored beside the
+                # referenced file. Only individually referenced files are
+                # copied now, so point the folder parameter at the rebuilt
+                # folder and leave the copy to those file references.
+                directory_item = dict(item_meta)
+                directory_item["kind"] = "alembic_directory_reference"
+                manifest.append(directory_item)
+                alembic_dir_refs.append((rel, directory_item))
+                if parm is not None and (os.path.isabs(raw) or expanded != raw):
+                    hip_dir = "$HIP/" + (rel or ".").lstrip("/")
+                    try:
+                        parm.set(hip_dir)
+                    except Exception as exc:
+                        failures.append({"node": parm.node().path() if parm else None, "parameter": parm.path() if parm else None, "resource": raw, "target": rel, "reason": "rewrite_failed", "detail": str(exc)})
+                        continue
+                    rewritten += 1
+                    directory_item["rewritten"] = hip_dir
+                emit("status", message="Alembic 目录引用按需重建，不复制整个文件夹：%s -> %s" % (parm.path() if parm else expanded, rel))
+                continue
             if storage_meta.get("source_is_external") and category:
                 emit("status", message="外部资源分类：%s | 归档目录：%s | 复制资源：%s" % (category, storage_meta.get("storage_directory"), os.path.basename(expanded)))
             elif storage_meta.get("source_is_external"):
@@ -474,12 +559,9 @@ def package(source, archive_root, skip_cache_outputs=True, skip_render_outputs=T
             target_path = os.path.join(package_dir, rel.replace("/", os.sep))
             copy_source = expanded
             copy_target = target_path
-            copied_parent_directory = False
-            if storage_meta.get("source_is_external") and category == "Alembics" and os.path.isfile(expanded):
-                copy_source = os.path.dirname(expanded)
-                copy_target = os.path.dirname(target_path)
-                copied_parent_directory = True
-                emit("status", message="按文件夹复制 Alembic：%s -> %s" % (copy_source, storage_meta.get("storage_directory")))
+            # Only the referenced file is copied; copy_item() builds whatever
+            # folder depth the target needs, so sibling Alembic files from the
+            # same source folder stay out of the package.
             folder_copy_key = (norm(copy_source), norm(copy_target)) if os.path.isdir(copy_source) else None
             folder_reused = folder_copy_key in copied_folder_targets if folder_copy_key else False
             try:
@@ -496,10 +578,6 @@ def package(source, archive_root, skip_cache_outputs=True, skip_render_outputs=T
             copied += copied_now
             item = dict(item_meta)
             item["target"] = rel
-            if copied_parent_directory:
-                item["copied_parent_directory"] = True
-                item["source_parent"] = copy_source
-                item["folder_reused"] = folder_reused
             if parm is not None and (os.path.isabs(raw) or expanded != raw):
                 if not (inside(expanded) and ("$HIP" in raw or "$JOB" in raw)):
                     hip_rel = "$HIP/" + rel.lstrip("/")
@@ -519,6 +597,21 @@ def package(source, archive_root, skip_cache_outputs=True, skip_render_outputs=T
         missing.append(missing_item)
         failures.append({"node": node_path, "parameter": parm.path() if parm else None, "resource": raw, "target": storage_meta.get("target"), "reason": "not_found"})
         emit("status", message="未找到资源：" + raw)
+
+    empty_alembic_dirs = 0
+    for rel_dir, directory_item in alembic_dir_refs:
+        rebuilt = os.path.join(package_dir, (rel_dir or ".").replace("/", os.sep))
+        has_files = False
+        if os.path.isdir(rebuilt):
+            for _, _, file_names in os.walk(rebuilt):
+                if file_names:
+                    has_files = True
+                    break
+        if not has_files:
+            empty_alembic_dirs += 1
+            directory_item["empty_after_rebuild"] = True
+            failures.append({"node": None, "parameter": directory_item.get("parm"), "resource": directory_item.get("raw"), "target": rel_dir, "reason": "empty_alembic_directory"})
+            emit("status", message="Alembic 目录引用没有对应的文件级引用，重建后为空：%s" % rel_dir)
 
     emit("status", message="保存归档 HIP…")
     dest = os.path.join(package_dir, os.path.basename(source))
@@ -542,9 +635,12 @@ def package(source, archive_root, skip_cache_outputs=True, skip_render_outputs=T
                 "renderer_nodes": filtered_renderer,
                 "category": filtered_category,
                 "node_rule": filtered_node,
+                "project_dirs": filtered_project_dirs,
+                "auxiliary_files": filtered_auxiliary + folder_auxiliary_skipped,
             },
             "category_counts": category_counts,
             "not_found": len(missing),
+            "alembic_dirs_empty": empty_alembic_dirs,
         },
         "resources": manifest,
         "failures": failures,
@@ -562,7 +658,7 @@ def package(source, archive_root, skip_cache_outputs=True, skip_render_outputs=T
         f.flush()
         os.fsync(f.fileno())
     os.replace(manifest_temp_path, manifest_path)
-    emit("done", package=dest, manifest=manifest_path, status=status, failures=len(failures), resources_copied=copied, parameters_rewritten=rewritten, filtered_cache_outputs=filtered_cache, filtered_render_outputs=filtered_render, filtered_renderer_nodes=filtered_renderer, filtered_category=filtered_category, filtered_node_rule=filtered_node, category_counts=category_counts, not_found=len(missing))
+    emit("done", package=dest, manifest=manifest_path, status=status, failures=len(failures), resources_copied=copied, parameters_rewritten=rewritten, filtered_cache_outputs=filtered_cache, filtered_render_outputs=filtered_render, filtered_renderer_nodes=filtered_renderer, filtered_category=filtered_category, filtered_node_rule=filtered_node, filtered_project_dirs=filtered_project_dirs, filtered_auxiliary_files=filtered_auxiliary + folder_auxiliary_skipped, category_counts=category_counts, not_found=len(missing))
 
 
 if __name__ == "__main__":
@@ -577,4 +673,4 @@ if __name__ == "__main__":
         pos = options.index("--package-dir")
         if pos + 1 < len(options):
             fixed_package_dir = options[pos + 1]
-    package(sys.argv[1], sys.argv[2], "--include-cache-outputs" not in options, "--include-render-outputs" not in options, categories, "--filter-red-nodes" in options, "--filter-external" in options, fixed_package_dir=fixed_package_dir)
+    package(sys.argv[1], sys.argv[2], "--include-cache-outputs" not in options, "--include-render-outputs" not in options, categories, "--filter-red-nodes" in options, "--filter-external" in options, fixed_package_dir=fixed_package_dir, skip_auxiliary_files="--include-auxiliary-files" not in options)

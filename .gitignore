@@ -11,3 +11,6 @@ test_archive_*/
 
 # Local archive output
 archive/
+
+# WorkBuddy project data
+.workbuddy/

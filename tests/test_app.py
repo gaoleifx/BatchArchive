@@ -1,3 +1,4 @@
+import json
 import os
 import queue
 import sys
@@ -58,7 +59,7 @@ class DropListTests(unittest.TestCase):
 
         window._set_packaging_ui(False)
 
-        self.assertEqual(window.start_btn.text(), "开始依次打包")
+        self.assertEqual(window.start_btn.text(), "开始打包")
         self.assertTrue(window.start_btn.isEnabled())
         self.assertFalse(window.stop_btn.isEnabled())
         self.assertFalse(window.stop_btn.property("packagingActive"))
@@ -79,6 +80,39 @@ class ArchiveWorkerTests(unittest.TestCase):
         while not events.empty():
             records.append(events.get_nowait())
         return records, "\n".join(str(record) for record in records)
+
+    def test_auxiliary_switch_controls_the_packager_flag(self):
+        helper_source = """\
+import json
+import pathlib
+import sys
+
+package_dir = pathlib.Path(sys.argv[sys.argv.index('--package-dir') + 1])
+package_dir.mkdir(parents=True, exist_ok=True)
+(package_dir / 'args.json').write_text(json.dumps(sys.argv))
+package = package_dir / pathlib.Path(sys.argv[1]).name
+package.write_bytes(b'packaged hip')
+manifest = {'status': 'success', 'failures': [], 'source': str(pathlib.Path(sys.argv[1]).resolve()), 'package': str(package.resolve())}
+(package_dir / 'package_manifest.json').write_text(json.dumps(manifest))
+"""
+        for skip_auxiliary, expected_flag in ((True, False), (False, True)):
+            with tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                source = root / "scene.hip"
+                source.write_bytes(b"hip")
+                helper = root / "fake_packager.py"
+                helper.write_text(helper_source, encoding="utf-8")
+                events = queue.Queue()
+                worker = ArchiveWorker(
+                    [str(source)], sys.executable, str(root / "archive"), True, True,
+                    {"Geometry"}, False, False, events, skip_auxiliary,
+                )
+
+                with mock.patch("app.PACKAGE_SCRIPT", helper):
+                    worker.run()
+
+                args = json.loads((root / "archive" / "scene" / "args.json").read_text())
+                self.assertEqual("--include-auxiliary-files" in args, expected_flag)
 
     def test_not_found_manifest_stops_without_repeating_the_whole_job(self):
         helper_source = """\

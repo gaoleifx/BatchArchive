@@ -182,7 +182,7 @@ class BrandLoader(QtWidgets.QWidget):
 class ArchiveWorker(threading.Thread):
     MAX_ATTEMPTS = 3
 
-    def __init__(self, tasks, hython, output_mode, skip_cache_outputs, skip_render_outputs, categories, filter_red_nodes, filter_external_nodes, events):
+    def __init__(self, tasks, hython, output_mode, skip_cache_outputs, skip_render_outputs, categories, filter_red_nodes, filter_external_nodes, events, skip_auxiliary_files=True):
         super().__init__(daemon=True)
         self.tasks = tasks
         self.hython = hython
@@ -192,6 +192,7 @@ class ArchiveWorker(threading.Thread):
         self.categories = categories
         self.filter_red_nodes = filter_red_nodes
         self.filter_external_nodes = filter_external_nodes
+        self.skip_auxiliary_files = skip_auxiliary_files
         self.events = events
         self.stop_requested = False
         self.process = None
@@ -202,6 +203,16 @@ class ArchiveWorker(threading.Thread):
             self.process.terminate()
 
     def run(self):
+        try:
+            self._run()
+        except Exception as exc:
+            self.events.put(("log", f"打包线程异常退出：{exc}"))
+        finally:
+            # Always signal completion so the GUI never stays stuck in the
+            # "打包中" state when the worker dies unexpectedly.
+            self.events.put(("finished", not self.stop_requested))
+
+    def _run(self):
         total = len(self.tasks)
         for index, hip in enumerate(self.tasks, 1):
             if self.stop_requested:
@@ -224,6 +235,8 @@ class ArchiveWorker(threading.Thread):
                 cmd.append("--include-cache-outputs")
             if not self.skip_render_outputs:
                 cmd.append("--include-render-outputs")
+            if not self.skip_auxiliary_files:
+                cmd.append("--include-auxiliary-files")
             cmd.extend(["--categories", ",".join(sorted(self.categories))])
             if self.filter_red_nodes:
                 cmd.append("--filter-red-nodes")
@@ -307,7 +320,6 @@ class ArchiveWorker(threading.Thread):
             state = "完成" if success else "失败"
             self.events.put(("item", index - 1, state))
             self.events.put(("progress", int(index * 100 / total)))
-        self.events.put(("finished", not self.stop_requested))
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -331,8 +343,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.output_edit = QtWidgets.QLineEdit()
         self.skip_cache_cb = SwitchCheckBox("跳过工程内部缓存输出（bgeo / sim / vdb 等）")
         self.skip_render_cb = SwitchCheckBox("跳过工程内部渲染输出（exr / AOV 等）")
+        self.skip_auxiliary_cb = SwitchCheckBox("跳过脚本/配置文件（json / py / txt 等）")
         self.skip_cache_cb.setChecked(True)
         self.skip_render_cb.setChecked(True)
+        self.skip_auxiliary_cb.setChecked(True)
         self.category_names = ["Image/Textures", "Geometry", "Alembics", "USDs", "HDAs"]
         self.category_cbs = {name: SwitchCheckBox(name) for name in self.category_names}
         for checkbox in self.category_cbs.values():
@@ -412,7 +426,7 @@ class MainWindow(QtWidgets.QMainWindow):
         rule_hint = QtWidgets.QLabel("不勾选时不增加节点限制；同时勾选时必须同时满足。")
         rule_hint.setObjectName("muted"); rule_hint.setWordWrap(True); two_layout.addWidget(rule_hint); right_layout.addWidget(group_two)
         group_output = QtWidgets.QGroupBox("输出过滤"); output_layout = QtWidgets.QVBoxLayout(group_output)
-        output_layout.addWidget(self.skip_cache_cb); output_layout.addWidget(self.skip_render_cb); right_layout.addWidget(group_output)
+        output_layout.addWidget(self.skip_cache_cb); output_layout.addWidget(self.skip_render_cb); output_layout.addWidget(self.skip_auxiliary_cb); right_layout.addWidget(group_output)
         panel_hint = QtWidgets.QLabel("未分类资源保留原有打包行为。内部路径使用标准目录，外部资源进入 external。")
         panel_hint.setObjectName("muted"); panel_hint.setWordWrap(True); right_layout.addWidget(panel_hint); right_layout.addStretch(1)
 
@@ -553,7 +567,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for i in range(self.list.count()): self.list.item(i).setText(tasks[i] + "    [等待]")
         self._set_packaging_ui(True)
         categories = {name for name, checkbox in self.category_cbs.items() if checkbox.isChecked()}
-        self.worker = ArchiveWorker(tasks, hython, self.output_edit.text().strip(), self.skip_cache_cb.isChecked(), self.skip_render_cb.isChecked(), categories, self.red_node_cb.isChecked(), self.external_node_cb.isChecked(), self.events); self.worker.start()
+        self.worker = ArchiveWorker(tasks, hython, self.output_edit.text().strip(), self.skip_cache_cb.isChecked(), self.skip_render_cb.isChecked(), categories, self.red_node_cb.isChecked(), self.external_node_cb.isChecked(), self.events, self.skip_auxiliary_cb.isChecked()); self.worker.start()
 
     def _stop(self):
         if self.worker: self.worker.stop(); self.log.appendPlainText("已请求停止，正在终止当前 HIP。")
