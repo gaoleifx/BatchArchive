@@ -28,6 +28,8 @@
 
 依赖外部条件：本机装有 Houdini，`C:\Program Files\Side Effects Software\Houdini <ver>\bin\hython.exe` 存在（GUI 会自动枚举所有已安装版本，也允许手动指定）。
 
+> **分支约定：** 本文描述的是 `main`——纯 Python/PyQt5 版。`rust-shell` 分支上另有一个 egui 单文件 exe 外壳实验（`src/` + 被编译进二进制的 `scripts/package_houdini.py`），**不并入 main**，两者共用同一套 Python 内核与 stdout JSON 协议。2026-11-12 曾合并进 main，同日撤回。要改 Rust 外壳请切到该分支，改动内核时记得两边同步。
+
 ---
 
 ## 3. 双进程架构（最重要的一张图）

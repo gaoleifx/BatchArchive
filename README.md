@@ -7,6 +7,10 @@
 [![houdini](https://img.shields.io/badge/Houdini-hython-FF4713)](#环境要求)
 [![gui](https://img.shields.io/badge/GUI-PyQt5-41CD52?logo=qt&logoColor=white)](#环境要求)
 
+---
+
+## 这是什么
+
 一个镜头工程往往散落在项目目录、共享盘、素材盘好几个地方。直接把 `.hip` 拷给别人，结果就是丢贴图、丢 Alembic、丢 HDA。
 
 BatchArchive 读一遍工程的 `hou.fileReferences()`，把真正被引用的外部资源挑出来复制到归档目录里归好位，再把工程里的绝对路径改写成 `$HIP/...`。归档包拿到任何一台装了 Houdini 的机器上，打开就能跑。
@@ -36,7 +40,7 @@ BatchArchive 读一遍工程的 `hou.fileReferences()`，把真正被引用的�
 - **自动扫描真实引用** —— 基于 `hou.fileReferences()`，并对 File Cache 2.0 之类容易漏的 `sopoutput` 做二次补扫。
 - **外部资源分类归位** —— 贴图 / 几何 / Alembic / USD / HDA 各回各家，不再一股脑塞 `external/`。
 - **路径全部改成 `$HIP/...`** —— 归档包搬机器、换盘符都不散架；原本就指向工程内部的 `$HIP` / `$JOB` 不会重复改写。
-- **不乱搬工程目录** —— 参数如果指向工程目录本身或更上层（PDG 的 working dir 写成 `$HIP` 是常见写法），只记录不改写、不复制，避免把整卷项目和备份一起卷进包里。
+- **不乱搬工程目录** —— 参数如果指向工程目录本身或更上层（PDG 的 working dir 写成 `$HIP` 是常见写法），只记录不改写、不复制，避免把整个项目卷进包里。
 - **不会静默产出残包** —— 复制失败、路径变量没解析、Alembic 目录为空，全部进 `failures` 并被判失败，而不是"看起来成功"。
 - **可追溯** —— 每个归档目录都有人看的 `archive_log.txt` 和给程序校验的 `package_manifest.json`，含分类计数与过滤原因。
 - **失败会自己重来一次** —— 复制类瞬时故障最多重试 3 次，复用同一个归档目录保留已拷贝的大文件；资源不存在这类确定性错误直接停，不做无效重跑。
@@ -212,6 +216,7 @@ BatchArchive/
 ├── tests/                  # unittest，一套 fake hou，一套 offscreen Qt
 ├── AGENTS.md               # 给接手者/AI 的架构说明（数据流、改哪安全）
 ├── DESIGN.md               # UI 设计系统与决策流水
+├── README.txt              # 随包分发的纯文本快速启动
 └── README.md
 ```
 
@@ -238,6 +243,12 @@ python -m unittest discover -s tests
 - 引用里还剩 `$` / `%` 没解析出来（变量缺失）会记为失败 `unresolved_path`，不会猜路径。
 - 渲染器排除目前不可配置。要改成开关得同时动四处：`package()` 默认值、CLI 解析、GUI 控件、文档，缺一处就会出现"界面能关但实际没关"的假开关。
 - 目标目录已存在时自动 `_02`、`_03`，**不覆盖**旧包，所以反复打包会堆积目录，需要手动清理。
+
+---
+
+## 另一个分支：Rust 单文件外壳
+
+`rust-shell` 分支上有一个 egui 版的实验外壳：编译成单个 exe、内嵌同一份打包脚本、目标机不需要 Python。它不在这条分支上，交叉编译与 Windows 实机验证仍未完成。要用的话切到该分支看它自己的 README。
 
 ---
 
