@@ -1,7 +1,7 @@
 # BatchArchive · 项目概述
 
 > 面向接手本项目的开发者 / AI Agent 的入口文档。读完这一篇应能定位代码、理解数据流、知道改哪里安全、知道什么不能碰。
-> 最后更新：2026-11-12
+> 最后更新：2026-11-26
 
 ---
 
@@ -60,24 +60,26 @@
 | 文件 | 行数 | 职责 | 改动风险 |
 |---|---|---|---|
 | `app.py` | ~600 | GUI + 队列调度 + 重试循环 + 结果校验调用 | 中（UI 状态机易卡死） |
-| `package_houdini.py` | ~680 | **核心**：扫描引用、分类、过滤、复制、改写路径、写清单 | 高（逻辑密集，改错静默出错包） |
+| `package_houdini.py` | ~1080 | **核心**：扫描引用、分类、过滤、复制、改写路径、写清单 | 高（逻辑密集，改错静默出错包） |
 | `archive_policy.py` | ~37 | 两个纯函数：`should_retry` / `is_valid_success` | 低，但语义关键 |
+| `hip_version.py` | ~150 | 纯逻辑：读 HIP 保存版本（`_HIP_SAVEVERSION`）+ 按版本挑 hython | 低，但判据别改错 |
 | `repair_hip_paths.py` | ~18 | 一次性修补脚本：把归档 HIP 里的相对路径补成 `$HIP/` | 低，独立工具 |
-| `launch_gui.cmd` | ~45 | 启动器：找 Python、装 PyQt5、起 app | 低 |
-| `tests/test_app.py` | ~320 | GUI/Worker 测试（off-screen Qt） | — |
-| `tests/test_package_houdini.py` | ~340 | 打包逻辑测试（fake `hou` 模块注入） | — |
+| `launch_gui.cmd` | ~85 | 启动器：挑一个**带 PyQt5** 的 Python、装依赖、起 app。**必须纯 ASCII + CRLF**，不能放中文 | 低 |
+| `tests/test_app.py` | ~415 | GUI/Worker 测试（off-screen Qt） | — |
+| `tests/test_package_houdini.py` | ~930 | 打包逻辑测试（fake `hou` 模块注入） | — |
+| `tests/test_hip_version.py` | ~130 | 版本探测与 hython 匹配测试（纯函数，无需 Qt/hou） | — |
 | `README.md` | — | **面向 GitHub / 用户的主文档**：特性、过滤规则、归档结构、CLI、成功判定 | 需与实现同步 |
 | `README.txt` | — | 随包分发的纯文本快速启动（只保留操作步骤，细节指向 README.md） | 低（刻意保持简短） |
 | `DESIGN.md` | — | 设计决策流水（**部分已过期**，见 §9） | — |
 
-`archive_policy.py` 被单独拆出来是有意为之：它不 `import hou`、不 `import PyQt5`，所以纯逻辑可被两条测试线共同复用，且能在任何 Python 环境下跑。
+`archive_policy.py` 被单独拆出来是有意为之：它不 `import hou`、不 `import PyQt5`，所以纯逻辑可被两条测试线共同复用，且能在任何 Python 环境下跑。`hip_version.py` 同理——GUI 和 hython 侧都要用它，且要能在裸 Python 下测。
 
 ---
 
 ## 5. 打包流程（`package()` 的执行顺序）
 
 1. **建目录** —— 有 `--package-dir` 就用它（重试复用），否则 `<archive_root>/<stem>`，冲突则 `_02`、`_03`。
-2. **加载并扫描** —— `hou.hipFile.load()`，然后 `hou.fileReferences()`。扫描期间起一个守护线程，每秒发一次「仍在扫描…已用时 N 秒」，避免大工程看起来像卡死。
+2. **加载并扫描** —— `hou.hipFile.load()`，随即读 `hou.applicationVersionString()` 与 `--expect-version` 比对（不一致只记日志与清单，不判失败），然后 `hou.fileReferences()`。扫描期间起一个守护线程，每秒发一次「仍在扫描…已用时 N 秒」，避免大工程看起来像卡死。
 3. **补扫 File Cache 输出** —— `fileReferences()` 有时漏掉 File Cache 2.0 的 `sopoutput`，遍历全场景节点手动补进 `refs`。
 4. **逐条处理每个引用**（顺序即优先级，改代码时不要打乱）：
    - 渲染器节点 → 排除（默认始终生效）
@@ -88,7 +90,8 @@
    - `temp:` / `op:` / `opdef:` / `oplib:` → 跳过（不是文件资源）
    - 含未解析变量（`$` 或 `%` 还在）→ **记为失败 `unresolved_path`**，不静默跳过
    - Houdini 安装目录内 → 跳过
-   - 反引号表达式（序列）→ glob 全部匹配文件、整目录复制、改写
+   - 序列引用（反引号表达式、`$F`/`$F4`/`$SF`/`$SF4`/`$FF`）→ token 化后 glob 全部匹配帧、逐帧复制、改写时保留原表达式
+   - 帧 token 已被解析掉的缓存输出（File Cache 2.0 的 `sopoutput`）→ 见 §6.3 的「单帧反推」，仍走上面的序列分支
    - 工程目录本身或更上层 → 只记录、不改参数、不复制（防止把整个项目卷进包里）
    - Alembic 目录引用 → 改写成归档目录，复制交给文件级引用
    - 普通文件/目录 → 复制 + 改写为 `$HIP/...`
@@ -122,6 +125,19 @@
 
 注意「输入 vs 输出」的区分：`/geo/`、`/cache/`、`/sim/`、`/render/` 下的文件既可能是缓存输出，也可能是 SOP File 节点读取的输入。代码靠「节点/参数是否属于写入者」来判断（`filecache` 无输入的节点视为只读缓存源，必须保留）。**这是最容易改出 bug 的地方。**
 
+另外：**File Cache HDA 内部的节点跟随缓存输出开关**。File Cache 2.0 会在 HDA 里自动建 `read_back`（一个 `file` SOP，参数是 `` `chs("../sopoutput")` ``），它读的正是该 HDA 写的缓存。`inside_filecache()` 会把这类内部引用判为 `cache_output`，默认随缓存一起跳过——否则包里会留下「半条缓存 + 一个过期帧」，比整条跳过更糟。勾选「包含缓存输出」时它们按普通依赖处理。
+
+**单帧反推（`infer_sequence()`，2026-11-26）**：`hou.fileReferences()` 给出的 `sopoutput` 是**已经算好的单帧绝对路径**（`..._v1.0149.bgeo.sc`），帧 token 只剩在 `descriptivelabel`（`` `opname("..")`_$OS_v1.$F4.bgeo.sc ``）里；`read_back/file` 存的甚至是个旧帧号。因此序列判定不能只看 `raw`：
+
+1. `sequence_pattern(raw)` 无 token 时，才允许反推；
+2. 反推必须有**证据**（`sequence_evidence()` + `has_frame_token()`）：参数自身未展开值、或父 File Cache HDA 的 `descriptivelabel` / `sopoutput` / `filepattern` 里还有帧 token。只有 `chs(...)` 这类纯间接引用**不算证据**；
+3. 用 `FRAME_DIGITS_LEAF`（`prefix + 数字 + 非数字后缀`）拆解已解析的文件名，glob 同目录同前后缀、**等宽数字**的兄弟文件，命中 ≥2 个才算序列，token 按位宽还原成 `$F4` / `$F`；
+4. 清单记 `sequence_inferred: true`，状态行会打「缓存输出已被解析为单帧，按帧号推断出序列」。
+5. 从 HDA 借来的 token 必须**能对上这个文件名**（`evidence_matches_leaf()`）：`` `opname("..")` ``、`$OS` 这类 Python 解析不了的片段当 `.*`，只核对字面量与帧位宽。否则「同目录里另一条看着像的序列」会被误扩。参数自己本来就有 token 的（`raw` / `unexpandedString`）不受此限，本来就无需核对。
+6. 缓存 HDA 的帧范围是**单帧**（`f1 == f2`，`cache_frame_span()`）时**不反推**：那是刻意写成的静帧缓存，兄弟帧不属于工程。
+
+没有证据就不许放宽：一个普通 SOP File 指着某一帧，不该把同目录的兄弟帧一起卷走。补扫循环（§5 第 3 步）只在 `sopoutput` 完全没进 `fileReferences()` 时才追加引用，所以「已进 refs 但值是单帧」这条路只能靠反推兜住。
+
 ### 6.4 渲染器排除
 
 Mantra / Karma / Arnold / Redshift / RenderMan / USD Render / V-Ray / Octane，以及 Render Gallery 的 Manager 节点。裸词 `render` 只在节点已经属于 `driver` / `lop` 类别时才当信号——否则 `render` 这类常见子串会误杀大量非渲染节点。
@@ -139,7 +155,26 @@ Mantra / Karma / Arnold / Redshift / RenderMan / USD Render / V-Ray / Octane，�
 **改写规则：** 所有归档后的引用一律写成 `$HIP/<相对路径>`。
 - 原本就是 `$HIP` / `$JOB` 且指向工程内部的，不重复改写
 - 指向工程目录本身或更上层的参数，**原样保留不改**
-- 反引号序列：保留序列语义，文件名部分取自当前求值结果
+- 序列：**保留原始表达式**。文件名部分直接用 `raw` 的 basename（含 `$F4`、反引号），绝不替换成求值后的帧号——否则序列会被固定成单帧。`$HIPNAME`/`$OS` 也保持原样，交由 Houdini 打开时按节点解析
+- **表达式/通道驱动的参数不写**（`parm_is_computed()`：有 keyframe、有 `expression()`、或 `getReferencedParm()` 指向别人）。File Cache 2.0 的三个特征全占，`Parm.set()` 不抛错但**求值不变**，硬写只会在动画曲线上加一个键、并在清单里留下假的 `rewritten`。这类参数只要表达式基于 `$HIP`（默认 `basedir = $HIP/geo`），存档后自然指向归档副本，清单记 `rewrite_skipped: computed_parameter`；若它指向工程外又改不动，判失败 `rewrite_failed`，不交付仍指着源盘的包。`rewrite_parm()` 对可写的参数也会 `evalAsString()` 复核一遍，不再默认 `set()` 成功
+
+### 7.1 去重与计数口径
+
+**复制是按「归档目标路径」去重的，不是按引用数。** 归档目标由 `storage_info()` 从**源路径**确定性推导（工程内→相对路径，外部→`<类别>/<文件夹名>_<短哈希>`），所以多个节点指向同一套缓存时算出来的 `$HIP` 目标必然重合，第二处引用不会再写一遍字节。
+
+- 文件级：`copy_item()` 用 `same_archived_file()` 判断「已存在且大小 + mtime 都一致」→ 跳过 `copy2`。**不能只看大小**：重试复用归档目录时，缓存被重写成同样字节数就会被永久留成旧版。mtime 容差 2 秒，照顾 FAT / 网络盘的粗粒度时间戳。`copy2` 会保留 mtime，所以正常拷贝后判等是精确的。
+- 目录级：`copied_folder_targets` 以 `(源, 目标)` 为键，避免同一个目录被整棵 `os.walk` 走第二遍。
+- 序列：逐帧仍走 `copy_item()`，落盘用的是**真实帧文件名**（`os.path.basename(match)`）；`sequence_basename()` 只决定**回写的参数值**。所以「静态引用某一帧 + 序列引用同一帧」不会产生两份文件，只是同一个目标被复用。
+
+**计数三个口径别混：**
+
+| 字段 | 含义 |
+|---|---|
+| `summary.resources_copied` | 真正执行了 `copy2` 的**文件数** |
+| `summary.references_reused` | 命中已有副本的**引用数**（省掉的重复拷贝） |
+| `summary.duplicate_archive` | 同一物理文件被归档到 ≥2 个不同位置的**组数**；明细在顶层 `duplicates[]`（`{source, targets}`），`archive_log.txt` 里也单列一节「重复归档」 |
+
+**为什么还要报重复：** 每个参数都改写成自己的 `$HIP` 路径，两份路径都得存在，不能悄悄省掉一份——所以只报告不合并。真实会撞上的场景：一个无类别目录参数（整目录进 `external/`）+ 同一目录里的文件被 File 节点单独引用（进 `textures/`），同一份贴图各存一份。判定用的是 `norm(realpath())`，junction / 符号链接能被压成同一源；**盘符映射（`Z:` vs `D:`）压不掉**，仍会被当成两个源。
 
 ---
 
@@ -183,6 +218,51 @@ Mantra / Karma / Arnold / Redshift / RenderMan / USD Render / V-Ray / Octane，�
 - 新增 `README.md` 作为唯一的完整文档（GitHub 首页渲染）：特性、环境要求、GUI 流程、三组过滤规则、归档目录树、CLI 参数表、六条成功判定与重试策略、项目结构、开发测试、已知限制。
 - `README.txt` 收敛为纯文本快速启动（约 15 行），只留操作步骤与关键默认值，细节一律指向 `README.md`。**新增细节写进 README.md，不要往 txt 里加**，否则两份又会对不上。
 - 内容全部按当前实现核对过：CLI 参数取自 `package_houdini.py` 的 `sys.argv[3:]` 分支，分类与目录映射取自 `classify_resource` / `category_dirs` / `standard_rel`，启动器行为取自 `launch_gui.cmd`。
+
+### 2026-11-23 · 启动器改为纯 ASCII + 挑对解释器
+
+**现象：** 双击 `launch_gui.cmd` 后窗口里一片乱码，严重时变量也不展开（`echo ...%PYTHON_EXE%` 打出字面量）。
+
+**根因：** 批处理文件原本是 **UTF-8 无 BOM**，而 cmd 是**按当前代码页逐字节**读文件的。在 cp936 下，全角冒号 `：`(EF BC 9A) 的尾字节 0x9A 是 GBK 前导字节，会把紧跟的 `%` 吞掉，变量语法直接失效。
+
+**两次尝试都失败，别重走：**
+1. 首行加 `chcp 65001`：cp65001 下 cmd 解析批处理会行串位，把 `REM ...直接报 ImportError` 当命令执行，报 `can't open file 'C:\BatchArchive\直接报'`。
+2. 把文件转成 **GBK(cp936)**：在 cp936 控制台完美，但换到 **cp65001**（Windows Terminal / VS Code 集成终端常见）又变回乱码。同一份中文文本不可能同时满足两种代码页。
+
+**结论（必须遵守）：**
+- `launch_gui.cmd` 保持 **纯 ASCII + CRLF**，里面不写一个中文字、不写 `chcp`。中文说明只放 `README.md` / `README.txt`（在编辑器里看，不受代码页影响）。
+- 代码页 936 与 65001 下实测输出一致。
+- **解释器枚举用 `where python`，不要用 `py -3 -c "print(sys.executable)"`。** 后者含 `print(...)` 的小括号，一旦放进 `for /f` 且 `for` 又位于 `if ( )` 块内，内层 `()` 会把块提前闭合，整条探测**静默返回空**——现象就是所有候选都探不到、`PYTHON_EXE` 为空、最终落到兜底解释器并误报 `PyQt5 is missing, installing...`。这是 2026-11-23 第二次修 bug 的真正原因。
+- 选择链：`where python` 全量 → `%LocalAppData%\Programs\Python\Python31x`（新→旧）→ `C:\Python31x`；挑第一个能 `import PyQt5` 的，都不行才用第一个找到的兜底并自动 `pip install PyQt5`，装完**再验一次** `import PyQt5` 才启动 app。
+- 本机 PATH 上的 `python` 是 WorkBuddy 的 3.13，没有 PyQt5；只有 `Python311` 装了。直接 `python app.py` 会 `ModuleNotFoundError`。
+- 失败时统一走 `:fail`，打印 script / cwd / python / version 再 `pause`，避免窗口一闪而过什么都看不到。
+
+### 2026-11-23 · 打包前自动识别 HIP 保存版本
+
+**为什么：** 原来 `find_hython()` 直接取最高版本，等于强制用最新 Houdini 打开所有工程；跨大版本加载会静默改参数默认值，产出"看起来成功、其实已被升级"的包。
+
+**怎么读版本（`hip_version.read_version`）：** HIP 是 cpio(odc) 归档，`.variables` 成员里有 `set -g _HIP_SAVEVERSION = '21.0.596'`，位于文件前 ~1KB；读头部 1MiB 即可，实测 11MB 工程 0.5ms。缺失时退回节点 userdata 的 `___Version___\x00\x00\x00\x03\x00\x08<ver>`。
+
+**判据禁区：** 不要用 `$HOME/houdini21.0/poselib`、`HOUDIN~1.596/...` 这类字符串——那是保存机器的路径残留，换机器/换 `$HOME` 就失真。测试里专门有一条用例守着（`test_ignores_version_lookalikes_in_paths`）。
+
+**匹配策略（用户选的方案 2：警告 + 用最接近的更高版本继续）：** 完全一致 → 同 `主.次` 的其它 build → 更高的最接近版本 → 只能用更低版本 → 读不出用最新。除"完全一致"外都会在开工前弹一次确认框，并在日志里逐条写明。
+
+**落到哪里：**
+- GUI：队列项显示 `[H 21.0.596]`；下拉框首项是 `自动匹配`（不带副标题，保持简短），手选/手填即视为强制统一版本。
+- `ArchiveWorker` 新增 `hython_plan` / `expect_versions` 两个按任务对齐的列表，逐条选解释器并向子进程传 `--expect-version`。
+- `package()` 在 `hipFile.load` 后读 `hou.applicationVersionString()`，写进清单 `houdini: {saved_with, opened_with, version_match, minor_match}`，并在 `archive_log.txt` 输出「Houdini：保存 X / 打开 Y」。
+- **版本不一致不算失败**：`is_valid_success` 不看这个字段，只做记录与提示。
+
+### 2026-11-26 · 复制去重口径修正
+
+**问题：** 原先「已存在且大小相同」就算复制过，且 `copy_item()` 无论如何 `return 1`，导致两个错觉：几个节点共用一个缓存时日志写「复制 N」而磁盘上只有 1 个文件；反过来，重试复用的归档目录里，源缓存被重写成**同样大小**时会被判成已存在，包内留下旧数据。
+
+**改法：**
+- `same_archived_file()` 改为 大小 + mtime 双判据（容差 2s，兼容 FAT / 网络盘）；`copy_item()` 返回 `(新写入数, 复用数)`，目录递归逐层累加。
+- `summary.resources_copied` 只统计真实写入，新增 `summary.references_reused`；`archive_log.txt` 的资源行改成「复制 X，复用 Y」，GUI 的 `done` 日志行同步显示。
+- 新增 `archived_sources`（键为 `norm(realpath(src))`）与顶层 `duplicates[]`：同一源文件落到两个归档位置时报出来，进日志「重复归档」一节。不自动合并——两份路径都被参数引用着，删任一份都会断链。
+
+**测试：** `tests/test_package_houdini.py::SharedReferenceTests` 四条——两节点共享一个缓存只写一次、目录引用与文件引用导致的重复归档被报出、同大小同 mtime 记为复用、同大小但 mtime 变化必须重拷。
 
 ---
 

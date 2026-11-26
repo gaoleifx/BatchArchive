@@ -11,11 +11,23 @@ from pathlib import Path
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from archive_policy import is_valid_success, should_retry
+from hip_version import (
+    MATCH_BUILD,
+    MATCH_EXACT,
+    MATCH_NEWER,
+    MATCH_OLDER_ONLY,
+    MATCH_UNKNOWN,
+    pick_hython,
+    read_version,
+)
 
 
 APP_DIR = Path(__file__).resolve().parent
 PACKAGE_SCRIPT = APP_DIR / "package_houdini.py"
 HIP_EXTS = (".hip", ".hiplc", ".hipnc")
+AUTO_HYTHON = "__auto__"
+AUTO_PLACEHOLDER = "自动匹配：按每个 HIP 的保存版本选择"
+VERSION_ROLE = QtCore.Qt.UserRole + 1
 
 
 def find_hython_versions():
@@ -55,12 +67,32 @@ class DropList(QtWidgets.QListWidget):
 
     def add_path(self, path):
         path = os.path.abspath(path)
-        if os.path.isfile(path) and path.lower().endswith(HIP_EXTS):
-            known_paths = {os.path.normcase(existing) for existing in self.paths()}
-            if os.path.normcase(path) not in known_paths:
-                item = QtWidgets.QListWidgetItem(path)
-                item.setData(QtCore.Qt.UserRole, path)
-                self.addItem(item)
+        if not (os.path.isfile(path) and path.lower().endswith(HIP_EXTS)):
+            return None
+        known_paths = {os.path.normcase(existing) for existing in self.paths()}
+        if os.path.normcase(path) in known_paths:
+            return None
+        version, _method = read_version(path)
+        item = QtWidgets.QListWidgetItem(self.label(path, version))
+        item.setData(QtCore.Qt.UserRole, path)
+        item.setData(VERSION_ROLE, version or "")
+        self.addItem(item)
+        return item
+
+    @staticmethod
+    def label(path, version, state=None):
+        text = path + ("    [H " + version + "]" if version else "    [保存版本未知]")
+        return text if not state else text + "    [" + state + "]"
+
+    def versions(self):
+        return [self.item(i).data(VERSION_ROLE) or "" for i in range(self.count())]
+
+    def set_state(self, index, state):
+        item = self.item(index)
+        if item is None:
+            return
+        path = item.data(QtCore.Qt.UserRole) or item.text()
+        item.setText(self.label(path, item.data(VERSION_ROLE) or "", state))
 
     def paths(self):
         return [self.item(i).data(QtCore.Qt.UserRole) or self.item(i).text().rsplit("    [", 1)[0]
@@ -182,10 +214,14 @@ class BrandLoader(QtWidgets.QWidget):
 class ArchiveWorker(threading.Thread):
     MAX_ATTEMPTS = 3
 
-    def __init__(self, tasks, hython, output_mode, skip_cache_outputs, skip_render_outputs, categories, filter_red_nodes, filter_external_nodes, events, skip_auxiliary_files=True):
+    def __init__(self, tasks, hython, output_mode, skip_cache_outputs, skip_render_outputs, categories, filter_red_nodes, filter_external_nodes, events, skip_auxiliary_files=True, hython_plan=None, expect_versions=None):
         super().__init__(daemon=True)
         self.tasks = tasks
         self.hython = hython
+        # Per-task overrides: hython_plan[i] is the interpreter resolved from the
+        # saved HIP version, expect_versions[i] the version detected for that HIP.
+        self.hython_plan = list(hython_plan or [])
+        self.expect_versions = list(expect_versions or [])
         self.output_mode = output_mode
         self.skip_cache_outputs = skip_cache_outputs
         self.skip_render_outputs = skip_render_outputs
@@ -228,9 +264,15 @@ class ArchiveWorker(threading.Thread):
                 package_dir = archive / (hip_path.stem + "_%02d" % suffix)
                 suffix += 1
             manifest_path = package_dir / "package_manifest.json"
+            hython = self.hython_plan[index - 1] if index - 1 < len(self.hython_plan) and self.hython_plan[index - 1] else self.hython
+            expect_version = self.expect_versions[index - 1] if index - 1 < len(self.expect_versions) else ""
             self.events.put(("item", index - 1, "处理中"))
             self.events.put(("log", f"[{index}/{total}] 开始：{hip}"))
-            cmd = [self.hython, "-u", str(PACKAGE_SCRIPT), str(hip_path), str(archive), "--package-dir", str(package_dir)]
+            if expect_version:
+                self.events.put(("log", f"保存版本 Houdini {expect_version}，使用 {hython}"))
+            cmd = [hython, "-u", str(PACKAGE_SCRIPT), str(hip_path), str(archive), "--package-dir", str(package_dir)]
+            if expect_version:
+                cmd.extend(["--expect-version", expect_version])
             if not self.skip_cache_outputs:
                 cmd.append("--include-cache-outputs")
             if not self.skip_render_outputs:
@@ -275,7 +317,7 @@ class ArchiveWorker(threading.Thread):
                             if event.get("event") == "status":
                                 self.events.put(("log", event.get("message", "")))
                             elif event.get("event") == "done":
-                                self.events.put(("log", f"JSON 校验：{event.get('status', 'unknown')} | 失败 {event.get('failures', 0)} | 资源 {event.get('resources_copied', 0)} | 改写 {event.get('parameters_rewritten', 0)}"))
+                                self.events.put(("log", f"JSON 校验：{event.get('status', 'unknown')} | 失败 {event.get('failures', 0)} | 复制 {event.get('resources_copied', 0)} | 复用 {event.get('resources_reused', 0)} | 重复归档 {event.get('duplicate_archive', 0)} | 改写 {event.get('parameters_rewritten', 0)}"))
                         except Exception:
                             if line:
                                 self.events.put(("log", line))
@@ -333,13 +375,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.hython_versions = find_hython_versions()
         self.hython_combo = QtWidgets.QComboBox()
         self.hython_combo.setMinimumWidth(150)
-        for version, path in self.hython_versions:
-            self.hython_combo.addItem("Houdini " + version, path)
-        if not self.hython_versions:
-            self.hython_combo.addItem("未检测到 Houdini")
+        self._populate_hython_combo()
         self.hython_combo.currentIndexChanged.connect(self._on_hython_version_changed)
-        self.hython_edit = QtWidgets.QLineEdit(find_hython())
-        self.hython_edit.setPlaceholderText("也可以手动指定 hython.exe")
+        self.hython_edit = QtWidgets.QLineEdit()
+        self.hython_edit.setPlaceholderText(AUTO_PLACEHOLDER)
+        self.hython_edit.textEdited.connect(self._on_hython_text_edited)
         self.output_edit = QtWidgets.QLineEdit()
         self.skip_cache_cb = SwitchCheckBox("跳过工程内部缓存输出（bgeo / sim / vdb 等）")
         self.skip_render_cb = SwitchCheckBox("跳过工程内部渲染输出（exr / AOV 等）")
@@ -497,34 +537,92 @@ class MainWindow(QtWidgets.QMainWindow):
         QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width:0; background:transparent; }
         """)
 
+    def _populate_hython_combo(self, select_data=AUTO_HYTHON):
+        """Auto entry on top, then every installed build (newest first)."""
+        self.hython_combo.blockSignals(True)
+        self.hython_combo.clear()
+        self.hython_combo.addItem("自动匹配", AUTO_HYTHON)
+        for version, path in self.hython_versions:
+            self.hython_combo.addItem("Houdini " + version, path)
+        if not self.hython_versions:
+            self.hython_combo.addItem("未检测到 Houdini", "")
+        index = self.hython_combo.findData(select_data)
+        self.hython_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.hython_combo.blockSignals(False)
+
+    def _auto_hython(self):
+        return self.hython_combo.currentData() == AUTO_HYTHON
+
+    def _on_hython_text_edited(self, text):
+        # Typing a path means "use exactly this build", not auto matching.
+        self.hython_combo.blockSignals(True)
+        self.hython_combo.setCurrentIndex(-1)
+        self.hython_combo.blockSignals(False)
+
     def _browse_hython(self):
         p, _ = QtWidgets.QFileDialog.getOpenFileName(self, "选择 hython.exe", "", "hython.exe (hython.exe)")
         if p:
             self.hython_edit.setText(p)
+            self.hython_combo.blockSignals(True)
             self.hython_combo.setCurrentIndex(-1)
+            self.hython_combo.blockSignals(False)
 
     def _on_hython_version_changed(self, index):
-        path = self.hython_combo.itemData(index)
-        if path:
-            self.hython_edit.setText(path)
+        if index < 0:
+            return
+        data = self.hython_combo.itemData(index)
+        if data == AUTO_HYTHON:
+            self.hython_edit.clear()
+            self.hython_edit.setPlaceholderText(AUTO_PLACEHOLDER)
+        else:
+            self.hython_edit.setText(data or "")
 
     def _refresh_houdini_versions(self):
-        current = self.hython_edit.text().strip()
+        current = self.hython_combo.currentData()
+        manual = self.hython_edit.text().strip()
         self.hython_versions = find_hython_versions()
-        self.hython_combo.blockSignals(True)
-        self.hython_combo.clear()
-        for version, path in self.hython_versions:
-            self.hython_combo.addItem("Houdini " + version, path)
-        if not self.hython_versions:
-            self.hython_combo.addItem("未检测到 Houdini")
-        self.hython_combo.blockSignals(False)
-        selected = self.hython_combo.findData(current)
-        if selected >= 0:
-            self.hython_combo.setCurrentIndex(selected)
-        elif self.hython_versions:
-            self.hython_combo.setCurrentIndex(0)
-        else:
-            self.hython_edit.setText(current)
+        self._populate_hython_combo(current)
+        if current and current != AUTO_HYTHON and self.hython_combo.currentData() != current:
+            # The manually selected build is gone; keep the typed path instead.
+            self.hython_combo.blockSignals(True)
+            self.hython_combo.setCurrentIndex(-1)
+            self.hython_combo.blockSignals(False)
+            self.hython_edit.setText(manual)
+
+    def _plan_hython(self, tasks, versions, auto, manual):
+        """Resolve one hython per task; collect user-facing warnings."""
+        if not auto:
+            return [manual] * len(tasks), []
+        plan, warnings = [], []
+        for hip, saved in zip(tasks, versions):
+            version, path, status = pick_hython(saved or None, self.hython_versions)
+            plan.append(path or "")
+            name = os.path.basename(hip)
+            if status == MATCH_EXACT:
+                continue
+            if status == MATCH_BUILD:
+                warnings.append("%s：保存于 %s，将用同系列 %s 打开（build 不同）" % (name, saved, version))
+            elif status == MATCH_NEWER:
+                warnings.append("%s：本机没有 %s，将用最接近的更高版本 %s" % (name, saved, version))
+            elif status == MATCH_OLDER_ONLY:
+                warnings.append("%s：本机没有 ≥ %s 的版本，只能用较低的 %s 打开" % (name, saved, version))
+            elif status == MATCH_UNKNOWN:
+                warnings.append("%s：读不出保存版本，将用最新 %s" % (name, version))
+            else:
+                warnings.append("%s：没有可用的 Houdini 安装" % name)
+        return plan, warnings
+
+    def _confirm_version_warnings(self, warnings):
+        shown = warnings[:12]
+        if len(warnings) > len(shown):
+            shown.append("…另有 %d 个文件存在版本差异" % (len(warnings) - len(shown)))
+        answer = QtWidgets.QMessageBox.warning(
+            self, "Houdini 版本不一致",
+            "\n".join(shown) + "\n\n按方案继续打包吗？跨版本打开可能改变参数默认值。",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.Yes,
+        )
+        return answer == QtWidgets.QMessageBox.Yes
 
     def _browse_output(self):
         p = QtWidgets.QFileDialog.getExistingDirectory(self, "选择统一输出目录")
@@ -555,19 +653,27 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _start(self):
         if self.worker and self.worker.is_alive(): return
-        hython = self.hython_edit.text().strip()
         tasks = self.list.paths()
-        if not os.path.isfile(hython):
-            QtWidgets.QMessageBox.warning(self, "缺少 hython", "请指定有效的 hython.exe。")
-            return
         if not tasks:
             QtWidgets.QMessageBox.information(self, "没有任务", "请把 HIP 文件拖进窗口。")
             return
+        versions = self.list.versions()
+        auto = self._auto_hython()
+        manual = self.hython_edit.text().strip()
+        if auto and not self.hython_versions:
+            QtWidgets.QMessageBox.warning(self, "未检测到 Houdini", "自动匹配需要本机安装 Houdini；请手动选择 hython.exe。")
+            return
+        if not auto and not os.path.isfile(manual):
+            QtWidgets.QMessageBox.warning(self, "缺少 hython", "请指定有效的 hython.exe。")
+            return
+        hython_plan, warnings = self._plan_hython(tasks, versions, auto, manual)
+        if warnings and not self._confirm_version_warnings(warnings):
+            return
         self.progress.setValue(0); self.log.appendPlainText("开始打包，共 %d 个 HIP。" % len(tasks))
-        for i in range(self.list.count()): self.list.item(i).setText(tasks[i] + "    [等待]")
+        for i in range(self.list.count()): self.list.set_state(i, "等待")
         self._set_packaging_ui(True)
         categories = {name for name, checkbox in self.category_cbs.items() if checkbox.isChecked()}
-        self.worker = ArchiveWorker(tasks, hython, self.output_edit.text().strip(), self.skip_cache_cb.isChecked(), self.skip_render_cb.isChecked(), categories, self.red_node_cb.isChecked(), self.external_node_cb.isChecked(), self.events, self.skip_auxiliary_cb.isChecked()); self.worker.start()
+        self.worker = ArchiveWorker(tasks, manual or find_hython(), self.output_edit.text().strip(), self.skip_cache_cb.isChecked(), self.skip_render_cb.isChecked(), categories, self.red_node_cb.isChecked(), self.external_node_cb.isChecked(), self.events, self.skip_auxiliary_cb.isChecked(), hython_plan=hython_plan, expect_versions=versions); self.worker.start()
 
     def _stop(self):
         if self.worker: self.worker.stop(); self.log.appendPlainText("已请求停止，正在终止当前 HIP。")
@@ -582,9 +688,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.log.verticalScrollBar().setValue(self.log.verticalScrollBar().maximum())
             elif kind == "item":
                 i, state = event[1], event[2]
-                if i < self.list.count():
-                    base = self.list.item(i).text().rsplit("    [", 1)[0]
-                    self.list.item(i).setText(base + "    [" + state + "]")
+                self.list.set_state(i, state)
             elif kind == "progress": self.progress.setValue(event[1])
             elif kind == "finished":
                 self._set_packaging_ui(False); self.worker = None

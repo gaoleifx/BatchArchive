@@ -12,5 +12,8 @@ test_archive_*/
 # Local archive output
 archive/
 
+# Build output (packaged exe + frozen copy of the packager)
+dist/
+
 # WorkBuddy project data
 .workbuddy/

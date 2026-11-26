@@ -43,6 +43,83 @@ class DropListTests(unittest.TestCase):
         self.assertEqual(window.list.count(), 0)
         self.assertEqual(window.log.toPlainText(), "")
         self.assertEqual(window.progress.value(), 0)
+
+    def test_queue_shows_saved_version_and_keeps_path_stored(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "scene.hip"
+            source.write_bytes(b"\nset -g _HIP_SAVEVERSION = '21.0.596'\n")
+            widget = DropList()
+            widget.add_path(str(source))
+
+            self.assertEqual(widget.paths(), [str(source)])
+            self.assertEqual(widget.versions(), ["21.0.596"])
+            self.assertIn("[H 21.0.596]", widget.item(0).text())
+
+            widget.set_state(0, "完成")
+            self.assertIn("[H 21.0.596]    [完成]", widget.item(0).text())
+            self.assertEqual(widget.paths(), [str(source)])
+            self.assertEqual(widget.versions(), ["21.0.596"])
+
+    def test_unreadable_version_is_still_queued(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "scene.hip"
+            source.write_bytes(b"hip")
+            widget = DropList()
+            widget.add_path(str(source))
+
+            self.assertEqual(widget.paths(), [str(source)])
+            self.assertEqual(widget.versions(), [""])
+            self.assertIn("保存版本未知", widget.item(0).text())
+
+
+class HythonPlanningTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.application = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+    def _window(self, installed):
+        window = MainWindow()
+        window.hython_versions = installed
+        window._populate_hython_combo()
+        return window
+
+    INSTALLED = [
+        ("22.0.429", r"C:\H\22.0.429\bin\hython.exe"),
+        ("21.0.596", r"C:\H\21.0.596\bin\hython.exe"),
+    ]
+
+    def test_auto_mode_picks_the_matching_build_without_warning(self):
+        window = self._window(self.INSTALLED)
+        plan, warnings = window._plan_hython(["a.hip"], ["21.0.596"], True, "")
+
+        self.assertEqual(plan, [r"C:\H\21.0.596\bin\hython.exe"])
+        self.assertEqual(warnings, [])
+        window.close()
+
+    def test_auto_mode_warns_and_uses_closest_newer_build(self):
+        window = self._window(self.INSTALLED)
+        plan, warnings = window._plan_hython(["shot.hip"], ["22.0.368"], True, "")
+
+        self.assertEqual(plan, [r"C:\H\22.0.429\bin\hython.exe"])
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("shot.hip", warnings[0])
+        self.assertIn("22.0.368", warnings[0])
+        window.close()
+
+    def test_unknown_version_warns(self):
+        window = self._window(self.INSTALLED)
+        _, warnings = window._plan_hython(["odd.hip"], [""], True, "")
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("读不出保存版本", warnings[0])
+        window.close()
+
+    def test_manual_hython_bypasses_planning(self):
+        window = self._window(self.INSTALLED)
+        plan, warnings = window._plan_hython(["a.hip", "b.hip"], ["21.0.596", "22.0.368"], False, r"C:\custom\hython.exe")
+
+        self.assertEqual(plan, [r"C:\custom\hython.exe"] * 2)
+        self.assertEqual(warnings, [])
+        window.close()
         window.close()
 
     def test_packaging_button_state_swaps_label_and_primary_emphasis(self):
@@ -113,6 +190,42 @@ manifest = {'status': 'success', 'failures': [], 'source': str(pathlib.Path(sys.
 
                 args = json.loads((root / "archive" / "scene" / "args.json").read_text())
                 self.assertEqual("--include-auxiliary-files" in args, expected_flag)
+
+    def test_expect_version_is_forwarded_to_the_packager(self):
+        helper_source = """\
+import json
+import pathlib
+import sys
+
+package_dir = pathlib.Path(sys.argv[sys.argv.index('--package-dir') + 1])
+package_dir.mkdir(parents=True, exist_ok=True)
+(package_dir / 'args.json').write_text(json.dumps(sys.argv))
+package = package_dir / pathlib.Path(sys.argv[1]).name
+package.write_bytes(b'packaged hip')
+manifest = {'status': 'success', 'failures': [], 'source': str(pathlib.Path(sys.argv[1]).resolve()), 'package': str(package.resolve())}
+(package_dir / 'package_manifest.json').write_text(json.dumps(manifest))
+"""
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "scene.hip"
+            source.write_bytes(b"hip")
+            helper = root / "fake_packager.py"
+            helper.write_text(helper_source, encoding="utf-8")
+            events = queue.Queue()
+            worker = ArchiveWorker(
+                [str(source)], sys.executable, str(root / "archive"), True, True,
+                {"Geometry"}, False, False, events,
+                hython_plan=[sys.executable], expect_versions=["21.0.596"],
+            )
+
+            with mock.patch("app.PACKAGE_SCRIPT", helper):
+                worker.run()
+
+            args = json.loads((root / "archive" / "scene" / "args.json").read_text())
+            self.assertIn("--expect-version", args)
+            self.assertEqual(args[args.index("--expect-version") + 1], "21.0.596")
+            records, text = self._event_text(events)
+            self.assertIn("保存版本 Houdini 21.0.596", text)
 
     def test_not_found_manifest_stops_without_repeating_the_whole_job(self):
         helper_source = """\

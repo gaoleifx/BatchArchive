@@ -30,6 +30,8 @@
 - 2026-10-23 — script and config files (json, py, txt, log, md, xml, yaml, csv, ini, bat, sh) are skipped by default, both as direct references and inside copied folders; the switch and `--include-auxiliary-files` keep them.
 - 2026-11-11 — renderer and Render Gallery nodes are excluded unconditionally; the previous “规则二默认可取消勾选” wording in README was removed because no such switch exists.
 - 2026-11-11 — tokens, components and stack rewritten against the actual QSS; the old `#4F8CFF` / `#111827` values and the “latest HIP scanner” component no longer described the shipped UI.
+- 2026-11-26 — copy dedup is judged by size **and** mtime (2 s tolerance) instead of size alone, so a retry that reuses the package directory recopies a cache rewritten to the same byte count; `resources_copied` now counts real writes and `references_reused` counts hits on an existing copy.
+- 2026-11-26 — one physical file reaching two different archive locations is reported in `duplicates[]` / the log instead of being merged: both `$HIP` paths are referenced by parameters, so dropping either would break the package.
 
 ## Components
 - Brand row — `浆果文化 | BatchArchive`、`BrandLoader` 自绘球体、右上角就绪状态点
